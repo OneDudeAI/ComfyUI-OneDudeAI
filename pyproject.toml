@@ -1,0 +1,10 @@
+[project]
+name = "comfyui-onedudeai"
+description = "OneDudeAI custom nodes for ComfyUI"
+version = "0.1.0"
+license = { text = "MIT" }
+
+[tool.comfy]
+PublisherId = "onedudeai"
+DisplayName = "ComfyUI-OneDudeAI"
+Icon = ""
