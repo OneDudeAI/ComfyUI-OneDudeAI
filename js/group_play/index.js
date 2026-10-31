@@ -167,6 +167,7 @@ function finishOwner() {
   node._odai_state = "idle";
   node._odai_progress = null;
   node._odai_nodeStates = null;
+  node._odai_currentNodeId = null;
   _owner = null;
   repaint(node);
 }
@@ -179,7 +180,10 @@ function installListenersOnce() {
     const d = e && e.detail;
     const runningId = d && typeof d === "object" ? d.node : d;
     if (runningId == null) finishOwner();
-    else if (_owner) repaint(_owner);
+    else if (_owner) {
+      _owner._odai_currentNodeId = String(runningId);
+      repaint(_owner);
+    }
   });
   api.addEventListener("progress", (e) => {
     if (!_owner) return;
@@ -208,7 +212,17 @@ function installListenersOnce() {
     const states = _owner._odai_nodeStates || (_owner._odai_nodeStates = new Map());
     for (const [id, st] of Object.entries(nodes)) {
       if (!st) continue;
-      states.set(id, { value: Number(st.value) || 0, max: Number(st.max) || 0, state: st.state });
+      const prev = states.get(id);
+      // A generic restart counter — any node that re-enters "running" after
+      // not being "running" has started another pass (how a list-expanded
+      // batch, e.g. a 20-line text box or PixaromaPromptEach, actually looks
+      // from here: the SAME node id re-executing, confirmed live — no id
+      // suffix per iteration). Counts whichever node the ring is currently
+      // on, whatever upstream mechanism produced the repeat; no node-type
+      // check anywhere (corrected 2026-10-31 after hardcoding PromptEach).
+      let runCount = prev?.runCount || 0;
+      if (st.state === "running" && prev?.state !== "running") runCount += 1;
+      states.set(id, { value: Number(st.value) || 0, max: Number(st.max) || 0, state: st.state, runCount });
     }
     repaint(_owner);
   });
@@ -243,6 +257,7 @@ function queueGroup(node) {
   node._odai_state = "running";
   node._odai_progress = { value: 0, max: 0 };
   node._odai_nodeStates = new Map();
+  node._odai_currentNodeId = null;
   _owner = node;
   repaint(node);
 
@@ -287,7 +302,15 @@ function fractionsFor(node) {
     barFrac = Math.max(0, Math.min(1, sum / states.size));
   }
 
-  return { ringFrac, barFrac };
+  // "Image N" — generic repeat count of whichever node is currently running
+  // (see the progress_state handler). No assumed total: nothing in the
+  // system says ahead of time how many passes a batch will make.
+  let imageLabel = null;
+  const curId = node._odai_currentNodeId;
+  const curState = curId && states ? states.get(curId) : null;
+  if (curState && curState.runCount > 1) imageLabel = `Image ${curState.runCount}`;
+
+  return { ringFrac, barFrac, imageLabel };
 }
 
 function handleClick(node) {
@@ -309,7 +332,7 @@ function handleClick(node) {
 // Bar is drawn in BOTH states — idle shows an empty 0% track so it reads
 // as a readout that's "there, at rest", not something that only appears
 // mid-job.
-function svgFace(color, state, ringFrac, barFrac) {
+function svgFace(color, state, ringFrac, barFrac, imageLabel) {
   const rf = Math.max(0, Math.min(1, ringFrac));
   const bf = Math.max(0, Math.min(1, barFrac));
   const circumference = 2 * Math.PI * 40;
@@ -334,6 +357,11 @@ function svgFace(color, state, ringFrac, barFrac) {
          <path d="M 36 28 L 36 72 L 72 50 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
          <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>`;
 
+  const imageMarkup = imageLabel
+    ? `<text x="48" y="74" text-anchor="middle" font-size="9" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${imageLabel}</text>
+       <text x="48" y="74" text-anchor="middle" font-size="9" fill="#ffffff" font-family="sans-serif">${imageLabel}</text>`
+    : "";
+
   return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
     ${ringMarkup}
     <rect x="117" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
@@ -341,6 +369,7 @@ function svgFace(color, state, ringFrac, barFrac) {
     <rect x="118" y="${fillTop}" width="12" height="${barH * bf}" rx="5" fill="${color}"/>
     <text x="124" y="80" text-anchor="middle" font-size="12" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
     <text x="124" y="80" text-anchor="middle" font-size="12" fill="#ffffff" font-family="sans-serif">${pct}%</text>
+    ${imageMarkup}
   </svg>`;
 }
 
@@ -348,8 +377,8 @@ function renderVueFace(node) {
   if (!node._odaiRoot) return;
   const color = nodeColorFor(node);
   const state = node._odai_state || "idle";
-  const { ringFrac, barFrac } = fractionsFor(node);
-  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac);
+  const { ringFrac, barFrac, imageLabel } = fractionsFor(node);
+  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac, imageLabel);
 }
 
 function buildVueFace(node) {
@@ -413,6 +442,7 @@ app.registerExtension({
       this._odai_state = "idle";
       this._odai_progress = null;
       this._odai_nodeStates = null;
+      this._odai_currentNodeId = null;
       applyRenderer(this, isVueNodes());
       this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
@@ -448,7 +478,20 @@ app.registerExtension({
       // disappear into an identically-colored body (reported 2026-10-31) —
       // the halo guarantees contrast regardless of what color is picked.
       ctx.save();
-      const { ringFrac, barFrac } = fractionsFor(this);
+      const { ringFrac, barFrac, imageLabel } = fractionsFor(this);
+
+      if (imageLabel) {
+        // Inside the circle, not below it — a fixed outer margin already
+        // sets the ring's radius to just clear the node's edge (the overflow
+        // this fixed, 2026-10-31), so there's no room outside it to add to.
+        ctx.font = `${Math.max(9, Math.round(radius * 0.17))}px sans-serif`;
+        ctx.textAlign = "center";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "#000000";
+        ctx.strokeText(imageLabel, cx, cy + radius * 0.6);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(imageLabel, cx, cy + radius * 0.6);
+      }
 
       // Bar is drawn in BOTH states — idle shows an empty 0% track, not just
       // the running one, so it reads as a readout that's "there, at rest"
