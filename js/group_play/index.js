@@ -78,8 +78,16 @@ function layoutFor(w, h) {
   if (showBar) {
     const barX = circleAreaW + (BAR_AREA - BAR_W) / 2;
     const top = MARGIN;
-    const bottom = h - MARGIN - 18; // room for the % label below the bar
-    bar = { x: barX, w: BAR_W, top, bottom, h: Math.max(0, bottom - top), labelY: h - MARGIN + 2 };
+    const bottom = h - MARGIN - 34; // room for two label lines below the bar
+    bar = {
+      x: barX,
+      w: BAR_W,
+      top,
+      bottom,
+      h: Math.max(0, bottom - top),
+      pctY: h - MARGIN - 16, // percentage line
+      posY: h - MARGIN + 2, // "N of X" line
+    };
   }
   return { cx, cy, radius, bar };
 }
@@ -168,6 +176,8 @@ function finishOwner() {
   node._odai_progress = null;
   node._odai_totalIds = null;
   node._odai_finishedIds = null;
+  node._odai_queueTotal = null;
+  node._odai_queueRemaining = null;
   _owner = null;
   repaint(node);
 }
@@ -208,6 +218,23 @@ function installListenersOnce() {
     }
     repaint(_owner);
   });
+  // Queue position ("N of X"). Real backend event: server.py get_queue_info /
+  // queue_updated send { status: { exec_info: { queue_remaining } } } on every
+  // queue change — the same counter the native top bar's queue display reads.
+  // It's a single global remaining-count, not a list of job identities, so
+  // "X" is the remaining count first observed right after this node queued
+  // (treated as the starting total) and "N" counts down as that remaining
+  // count drops — exact for this node's own click, approximate if someone
+  // else queues more work on the server while this is running.
+  api.addEventListener("status", (e) => {
+    if (!_owner) return;
+    const d = (e && e.detail) || {};
+    const remaining = d.status?.exec_info?.queue_remaining;
+    if (typeof remaining !== "number") return;
+    if (_owner._odai_queueTotal == null) _owner._odai_queueTotal = Math.max(remaining, 1);
+    _owner._odai_queueRemaining = remaining;
+    repaint(_owner);
+  });
   api.addEventListener("execution_success", finishOwner);
   api.addEventListener("execution_error", finishOwner);
   api.addEventListener("execution_interrupted", finishOwner);
@@ -240,6 +267,8 @@ function queueGroup(node) {
   node._odai_progress = { value: 0, max: 0 };
   node._odai_totalIds = new Set();
   node._odai_finishedIds = new Set();
+  node._odai_queueTotal = null;
+  node._odai_queueRemaining = null;
   _owner = node;
   repaint(node);
 
@@ -275,7 +304,16 @@ function fractionsFor(node) {
   const total = node._odai_totalIds ? node._odai_totalIds.size : 0;
   const done = node._odai_finishedIds ? node._odai_finishedIds.size : 0;
   const barFrac = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
-  return { ringFrac, barFrac };
+
+  let queueLabel = null;
+  const qTotal = node._odai_queueTotal;
+  const qRemaining = node._odai_queueRemaining;
+  if (qTotal != null && qRemaining != null) {
+    const remaining = Math.max(0, Math.min(qTotal, qRemaining));
+    const position = Math.max(1, Math.min(qTotal, qTotal - remaining + 1));
+    queueLabel = `${position} of ${qTotal}`;
+  }
+  return { ringFrac, barFrac, queueLabel };
 }
 
 function handleClick(node) {
@@ -294,38 +332,48 @@ function handleClick(node) {
 // SAME hex (that's what "solid" means), which would make an accent-colored
 // shape disappear into an identically-colored body — reported 2026-10-31.
 // The halo guarantees contrast regardless of what single color is picked.
-function svgIdle(color) {
-  return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
-    <circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
-    <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"/>
-    <path d="M 36 28 L 36 72 L 72 50 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
-    <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>
-  </svg>`;
-}
-
-function svgRunning(color, ringFrac, barFrac) {
+// Bar is drawn in BOTH states — idle shows an empty 0% track so it reads
+// as a readout that's "there, at rest", not something that only appears
+// mid-job. queueLabel ("N of X") is null/omitted when there's no queue
+// data yet (idle, or before the first "status" event of a run arrives).
+function svgFace(color, state, ringFrac, barFrac, queueLabel) {
   const rf = Math.max(0, Math.min(1, ringFrac));
   const bf = Math.max(0, Math.min(1, barFrac));
   const circumference = 2 * Math.PI * 40;
   const dash = circumference * rf;
-  const barTop = 10, barBottom = 82, barH = barBottom - barTop;
+  const barTop = 10, barBottom = 70, barH = barBottom - barTop;
   const fillTop = barBottom - barH * bf;
   const pct = Math.round(bf * 100);
+
+  const ringMarkup =
+    state === "running"
+      ? `<circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
+         <circle cx="48" cy="50" r="40" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
+         <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"
+           stroke-dasharray="${dash} ${circumference}" stroke-linecap="round"
+           transform="rotate(-90 48 50)"/>
+         <line x1="35" y1="37" x2="61" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
+         <line x1="61" y1="37" x2="35" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
+         <line x1="35" y1="37" x2="61" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+         <line x1="61" y1="37" x2="35" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>`
+      : `<circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
+         <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"/>
+         <path d="M 36 28 L 36 72 L 72 50 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
+         <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>`;
+
+  const queueMarkup = queueLabel
+    ? `<text x="124" y="92" text-anchor="middle" font-size="10" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${queueLabel}</text>
+       <text x="124" y="92" text-anchor="middle" font-size="10" fill="#ffffff" font-family="sans-serif">${queueLabel}</text>`
+    : "";
+
   return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
-    <circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
-    <circle cx="48" cy="50" r="40" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
-    <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"
-      stroke-dasharray="${dash} ${circumference}" stroke-linecap="round"
-      transform="rotate(-90 48 50)"/>
-    <line x1="35" y1="37" x2="61" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
-    <line x1="61" y1="37" x2="35" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
-    <line x1="35" y1="37" x2="61" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
-    <line x1="61" y1="37" x2="35" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    ${ringMarkup}
     <rect x="117" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
     <rect x="118" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
     <rect x="118" y="${fillTop}" width="12" height="${barH * bf}" rx="5" fill="${color}"/>
-    <text x="124" y="95" text-anchor="middle" font-size="13" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
-    <text x="124" y="95" text-anchor="middle" font-size="13" fill="#ffffff" font-family="sans-serif">${pct}%</text>
+    <text x="124" y="80" text-anchor="middle" font-size="12" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
+    <text x="124" y="80" text-anchor="middle" font-size="12" fill="#ffffff" font-family="sans-serif">${pct}%</text>
+    ${queueMarkup}
   </svg>`;
 }
 
@@ -333,12 +381,8 @@ function renderVueFace(node) {
   if (!node._odaiRoot) return;
   const color = nodeColorFor(node);
   const state = node._odai_state || "idle";
-  if (state === "running") {
-    const { ringFrac, barFrac } = fractionsFor(node);
-    node._odaiRoot.innerHTML = svgRunning(color, ringFrac, barFrac);
-  } else {
-    node._odaiRoot.innerHTML = svgIdle(color);
-  }
+  const { ringFrac, barFrac, queueLabel } = fractionsFor(node);
+  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac, queueLabel);
 }
 
 function buildVueFace(node) {
@@ -403,6 +447,8 @@ app.registerExtension({
       this._odai_progress = null;
       this._odai_totalIds = null;
       this._odai_finishedIds = null;
+      this._odai_queueTotal = null;
+      this._odai_queueRemaining = null;
       applyRenderer(this, isVueNodes());
       this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
@@ -438,8 +484,42 @@ app.registerExtension({
       // disappear into an identically-colored body (reported 2026-10-31) —
       // the halo guarantees contrast regardless of what color is picked.
       ctx.save();
+      const { ringFrac, barFrac, queueLabel } = fractionsFor(this);
+
+      // Bar is drawn in BOTH states — idle shows an empty 0% track, not just
+      // the running one, so it reads as a readout that's "there, at rest"
+      // rather than something that only appears mid-job.
+      if (bar) {
+        ctx.lineCap = "butt";
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(bar.x - 2, bar.top - 2, bar.w + 4, bar.h + 4);
+
+        ctx.fillStyle = color + ALPHA_SUFFIX;
+        ctx.fillRect(bar.x, bar.top, bar.w, bar.h);
+        const filledH = bar.h * barFrac;
+        ctx.fillStyle = color;
+        ctx.fillRect(bar.x, bar.bottom - filledH, bar.w, filledH);
+
+        const pctLabel = Math.round(barFrac * 100) + "%";
+        ctx.font = "13px sans-serif";
+        ctx.textAlign = "center";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "#000000";
+        ctx.strokeText(pctLabel, bar.x + bar.w / 2, bar.pctY);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(pctLabel, bar.x + bar.w / 2, bar.pctY);
+
+        if (queueLabel) {
+          ctx.font = "11px sans-serif";
+          ctx.strokeStyle = "#000000";
+          ctx.lineWidth = 3;
+          ctx.strokeText(queueLabel, bar.x + bar.w / 2, bar.posY);
+          ctx.fillStyle = "#ffffff";
+          ctx.fillText(queueLabel, bar.x + bar.w / 2, bar.posY);
+        }
+      }
+
       if (state === "running") {
-        const { ringFrac, barFrac } = fractionsFor(this);
         const lw = Math.max(3, radius * 0.14);
 
         ctx.lineCap = "round";
@@ -478,27 +558,6 @@ app.registerExtension({
         ctx.moveTo(cx + xr, cy - xr);
         ctx.lineTo(cx - xr, cy + xr);
         ctx.stroke();
-
-        if (bar) {
-          ctx.lineCap = "butt";
-          ctx.fillStyle = "#000000";
-          ctx.fillRect(bar.x - 2, bar.top - 2, bar.w + 4, bar.h + 4);
-
-          ctx.fillStyle = color + ALPHA_SUFFIX;
-          ctx.fillRect(bar.x, bar.top, bar.w, bar.h);
-          const filledH = bar.h * barFrac;
-          ctx.fillStyle = color;
-          ctx.fillRect(bar.x, bar.bottom - filledH, bar.w, filledH);
-
-          const label = Math.round(barFrac * 100) + "%";
-          ctx.font = "13px sans-serif";
-          ctx.textAlign = "center";
-          ctx.lineWidth = 3;
-          ctx.strokeStyle = "#000000";
-          ctx.strokeText(label, bar.x + bar.w / 2, bar.labelY);
-          ctx.fillStyle = "#ffffff";
-          ctx.fillText(label, bar.x + bar.w / 2, bar.labelY);
-        }
       } else {
         const lw = Math.max(2, radius * 0.08);
         ctx.strokeStyle = "#000000";
