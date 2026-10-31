@@ -70,16 +70,16 @@ function nodeColorFor(node) {
 // and clamping it, so it claims a shrinking proportion of width as the node
 // grows instead of a fixed share.
 const BAR_AREA_MIN = 50;
-const BAR_AREA_MAX = 170;
+const BAR_AREA_MAX = 320; // was 170 — too low a cap stopped the bars growing on a large node
 const BAR_AREA_FRACTION = 0.26; // of node width, before clamping
 const MARGIN_MIN = 10;
-const MARGIN_MAX = 40;
+const MARGIN_MAX = 60;
 const MARGIN_FRACTION = 0.09; // of min(w, topH), before clamping
 const VAE_STRIP_MIN = 26;
-const VAE_STRIP_MAX = 60;
+const VAE_STRIP_MAX = 140; // was 60 — same reason
 const VAE_STRIP_FRACTION = 0.22; // of node height, before clamping
 const STRIP_GAP_MIN = 4;
-const STRIP_GAP_MAX = 14;
+const STRIP_GAP_MAX = 28;
 const STRIP_GAP_FRACTION = 0.03; // of node height, before clamping
 const MIN_SHOW_BAR_W = 100; // below this absolute width, hide both bars — no room even scaled down
 const MIN_SHOW_BAR_H = 80; // below this absolute height, same
@@ -110,13 +110,16 @@ function layoutFor(w, h) {
   const radius = Math.max(10, Math.min(circleAreaW, topH) / 2 - MARGIN);
   // Scale text/stroke weight off the circle's OWN eventual radius, not a
   // separate global factor — ties every drawn element's size directly to
-  // how big the circle actually ends up.
-  const scale = Math.max(0.4, radius / 40); // 40 = a representative baseline radius for text/stroke sizing
+  // how big the circle actually ends up. Clamped at the top too: uncapped,
+  // a large node (radius in the hundreds) sent scale past 10x, and text
+  // sized off it ran far wider than its own bar (reported 2026-10-31: "the
+  // word sampler running off the node").
+  const scale = clamp(radius / 40, 0.4, 4); // 40 = a representative baseline radius for text/stroke sizing
 
   let samplerBar = null;
   let vaeBar = null;
   if (showBars) {
-    const barW = Math.min(BAR_AREA * 0.45, 40);
+    const barW = Math.min(BAR_AREA * 0.45, 90);
     const top = MARGIN;
     const bottom = topH - MARGIN - 26 * scale; // room for the % line + "Sampler" label below
     samplerBar = {
@@ -637,11 +640,12 @@ app.registerExtension({
       // rather than something that only appears mid-job. Sampler is always
       // live; VAE only fills/shows a % once one has actually run this
       // session — otherwise it's just a dim empty track + the word "VAE".
+      const haloPad = Math.max(1, 2 * scale);
       if (samplerBar) {
         const b = samplerBar;
         ctx.lineCap = "butt";
         ctx.fillStyle = "#000000";
-        ctx.fillRect(b.x - 2, b.top - 2, b.w + 4, b.h + 4);
+        ctx.fillRect(b.x - haloPad, b.top - haloPad, b.w + 2 * haloPad, b.h + 2 * haloPad);
         ctx.fillStyle = color + ALPHA_SUFFIX;
         ctx.fillRect(b.x, b.top, b.w, b.h);
         const filledH = b.h * barFrac;
@@ -671,7 +675,7 @@ app.registerExtension({
         const b = vaeBar;
         ctx.lineCap = "butt";
         ctx.fillStyle = "#000000";
-        ctx.fillRect(b.x - 2, b.top - 2, b.w + 4, b.h + 4);
+        ctx.fillRect(b.x - haloPad, b.top - haloPad, b.w + 2 * haloPad, b.h + 2 * haloPad);
         ctx.fillStyle = color + ALPHA_SUFFIX;
         ctx.fillRect(b.x, b.top, b.w, b.h);
         if (vaeActive) {
@@ -756,7 +760,7 @@ app.registerExtension({
           ctx.closePath();
         };
         ctx.strokeStyle = "#000000";
-        ctx.lineWidth = 4;
+        ctx.lineWidth = Math.max(2, 4 * scale);
         triPath();
         ctx.stroke();
         ctx.fillStyle = "#000000";
