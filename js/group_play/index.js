@@ -65,11 +65,19 @@ function nodeColorFor(node) {
 // node's own default size (DEFAULT_SIZE); every dimension below scales
 // off it, so a 2x bigger node gets a 2x bigger bar and 2x bigger text.
 const BASE_SIZE = 150;
-const BAR_AREA_BASE = 56; // width reserved on the right for the bar + its % label
-const BAR_W_BASE = 16;
+const BAR_AREA_BASE = 96; // width reserved on the right for both bars + labels
+const BAR_W_BASE = 14;
+const BAR_GAP_BASE = 10;
 const MARGIN_BASE = 18;
-const MIN_SHOW_BAR_W = 80; // below this absolute width, hide the bar — no room even scaled down
+const MIN_SHOW_BAR_W = 110; // below this absolute width, hide the bars — no room even scaled down
 
+// Two vertical bars: "S" = the sampler (or whichever node the ring is
+// currently on) — its own total progress, high-water smoothed so a restart
+// between passes doesn't saw backward. "V" = VAE encode/decode — detected
+// generically by INPUT TYPE ("VAE" on a node's own input slot, not any
+// class name — works for any pack's VAEDecode/VAEEncode/tiled/audio
+// variant), not shown filled until one actually runs (user, 2026-10-31:
+// "initialized after the sampler or when a decode or encode is happening").
 function layoutFor(w, h) {
   // A fixed margin wasn't enough once the node was resized into a wide
   // rectangle: a radius of min(w,h)/2 leaves the ring tangent to the
@@ -80,20 +88,28 @@ function layoutFor(w, h) {
   const MARGIN = MARGIN_BASE * scale;
   const BAR_AREA = BAR_AREA_BASE * scale;
   const BAR_W = BAR_W_BASE * scale;
+  const BAR_GAP = BAR_GAP_BASE * scale;
 
   const showBar = w >= MIN_SHOW_BAR_W;
   const circleAreaW = showBar ? Math.max(10, w - BAR_AREA) : w;
   const cx = circleAreaW / 2;
   const cy = h / 2;
   const radius = Math.max(10, Math.min(circleAreaW, h) / 2 - MARGIN);
-  let bar = null;
+
+  let bar1 = null;
+  let bar2 = null;
   if (showBar) {
-    const barX = circleAreaW + (BAR_AREA - BAR_W) / 2;
     const top = MARGIN;
-    const bottom = h - MARGIN - 18 * scale; // room for the % label below the bar
-    bar = { x: barX, w: BAR_W, top, bottom, h: Math.max(0, bottom - top), pctY: h - MARGIN + 2 * scale };
+    const bottom = h - MARGIN - 28 * scale; // room for the % line + letter line below each bar
+    const barH = Math.max(0, bottom - top);
+    const pctY = h - MARGIN - 12 * scale;
+    const letterY = h - MARGIN + 2 * scale;
+    const totalBarsW = BAR_W * 2 + BAR_GAP;
+    const startX = circleAreaW + (BAR_AREA - totalBarsW) / 2;
+    bar1 = { x: startX, w: BAR_W, top, bottom, h: barH, pctY, letterY, letter: "S" };
+    bar2 = { x: startX + BAR_W + BAR_GAP, w: BAR_W, top, bottom, h: barH, pctY, letterY, letter: "V" };
   }
-  return { cx, cy, radius, bar, scale };
+  return { cx, cy, radius, bar1, bar2, scale };
 }
 
 function nativeGroupUnderNode(node) {
@@ -148,6 +164,15 @@ function groupMemberNodes(bounds) {
   });
 }
 
+// Generic VAE detection: a node with a "VAE"-typed input slot — the type
+// system, not a class-name list, so it matches VAEDecode, VAEEncode, a
+// tiled or audio/video variant, or any future pack's VAE-consuming node
+// without naming any of them (corrected 2026-10-31 after hardcoding
+// PixaromaPromptEach once already — see [[no-hardwired-node-types-in-tools]]).
+function isVaeNode(n) {
+  return !!(n && Array.isArray(n.inputs) && n.inputs.some((inp) => inp && inp.type === "VAE"));
+}
+
 function isOutputNode(n) {
   const NEVER = window.LiteGraph?.NEVER != null ? window.LiteGraph.NEVER : 2;
   return !!(
@@ -180,6 +205,7 @@ function finishOwner() {
   node._odai_progress = null;
   node._odai_nodeStates = null;
   node._odai_currentNodeId = null;
+  node._odai_vaeNodeId = null;
   node._odai_barHighWater = 0;
   node._odai_barRunCount = 0;
   _owner = null;
@@ -241,6 +267,16 @@ function installListenersOnce() {
       if (st.state === "running" && prev?.state === "running" && value < prev.value) runCount += 1;
       else if (st.state === "running" && prev?.state !== "running") runCount += 1;
       states.set(id, { value, max: Number(st.max) || 0, state: st.state, runCount });
+
+      // Second bar ("V"): whichever node currently running has a VAE-typed
+      // input, generically detected — not the id the ring/first bar already
+      // tracks. Only updated while one is actually running, so it keeps
+      // showing its last real reading once that node finishes rather than
+      // blanking immediately.
+      if (st.state === "running" && id !== _owner._odai_currentNodeId) {
+        const liveNode = app.graph.getNodeById(id);
+        if (isVaeNode(liveNode)) _owner._odai_vaeNodeId = id;
+      }
     }
     repaint(_owner);
   });
@@ -276,6 +312,7 @@ function queueGroup(node) {
   node._odai_progress = { value: 0, max: 0 };
   node._odai_nodeStates = new Map();
   node._odai_currentNodeId = null;
+  node._odai_vaeNodeId = null;
   node._odai_barHighWater = 0;
   node._odai_barRunCount = 0;
   _owner = node;
@@ -337,7 +374,21 @@ function fractionsFor(node) {
   const barFrac = Math.max(rawFrac, node._odai_barHighWater || 0);
   node._odai_barHighWater = barFrac;
 
-  return { ringFrac, barFrac, imageLabel };
+  // Second bar: VAE encode/decode, generic (see isVaeNode / the
+  // progress_state handler). vaeActive stays false until one has actually
+  // run at least once this session — stays dim/empty until then.
+  const vaeId = node._odai_vaeNodeId;
+  const vaeState = vaeId && states ? states.get(vaeId) : null;
+  const vaeActive = !!vaeState;
+  const vaeFrac = vaeState
+    ? vaeState.max > 0
+      ? Math.max(0, Math.min(1, vaeState.value / vaeState.max))
+      : vaeState.state === "finished" || vaeState.state === "error"
+        ? 1
+        : 0.5 // running with no step count (max<=0) — a non-progress "active" pulse
+    : 0;
+
+  return { ringFrac, barFrac, vaeFrac, vaeActive, imageLabel };
 }
 
 function handleClick(node) {
@@ -359,14 +410,17 @@ function handleClick(node) {
 // Bar is drawn in BOTH states — idle shows an empty 0% track so it reads
 // as a readout that's "there, at rest", not something that only appears
 // mid-job.
-function svgFace(color, state, ringFrac, barFrac, imageLabel) {
+function svgFace(color, state, ringFrac, barFrac, vaeFrac, vaeActive, imageLabel) {
   const rf = Math.max(0, Math.min(1, ringFrac));
   const bf = Math.max(0, Math.min(1, barFrac));
+  const vf = Math.max(0, Math.min(1, vaeFrac));
   const circumference = 2 * Math.PI * 40;
   const dash = circumference * rf;
   const barTop = 10, barBottom = 70, barH = barBottom - barTop;
   const fillTop = barBottom - barH * bf;
+  const vaeFillTop = barBottom - barH * vf;
   const pct = Math.round(bf * 100);
+  const vaePct = vaeActive ? Math.round(vf * 100) + "%" : "—";
 
   const ringMarkup =
     state === "running"
@@ -389,13 +443,23 @@ function svgFace(color, state, ringFrac, barFrac, imageLabel) {
        <text x="48" y="74" text-anchor="middle" font-size="9" fill="#ffffff" font-family="sans-serif">${imageLabel}</text>`
     : "";
 
-  return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
+  // Two bars: "S" (sampler, always live) and "V" (VAE encode/decode,
+  // generic — see isVaeNode — only filled once one has actually run).
+  return `<svg viewBox="0 0 160 100" width="100%" height="100%" style="display:block">
     ${ringMarkup}
     <rect x="117" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
     <rect x="118" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
     <rect x="118" y="${fillTop}" width="12" height="${barH * bf}" rx="5" fill="${color}"/>
-    <text x="124" y="80" text-anchor="middle" font-size="12" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
-    <text x="124" y="80" text-anchor="middle" font-size="12" fill="#ffffff" font-family="sans-serif">${pct}%</text>
+    <text x="124" y="80" text-anchor="middle" font-size="11" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
+    <text x="124" y="80" text-anchor="middle" font-size="11" fill="#ffffff" font-family="sans-serif">${pct}%</text>
+    <text x="124" y="92" text-anchor="middle" font-size="8" fill="${color}" font-family="sans-serif" stroke="#000000" stroke-width="2" paint-order="stroke">S</text>
+
+    <rect x="139" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
+    <rect x="140" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
+    ${vaeActive ? `<rect x="140" y="${vaeFillTop}" width="12" height="${barH * vf}" rx="5" fill="${color}"/>` : ""}
+    <text x="146" y="80" text-anchor="middle" font-size="11" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${vaePct}</text>
+    <text x="146" y="80" text-anchor="middle" font-size="11" fill="#ffffff" font-family="sans-serif">${vaePct}</text>
+    <text x="146" y="92" text-anchor="middle" font-size="8" fill="${color}" font-family="sans-serif" stroke="#000000" stroke-width="2" paint-order="stroke">V</text>
     ${imageMarkup}
   </svg>`;
 }
@@ -404,8 +468,8 @@ function renderVueFace(node) {
   if (!node._odaiRoot) return;
   const color = nodeColorFor(node);
   const state = node._odai_state || "idle";
-  const { ringFrac, barFrac, imageLabel } = fractionsFor(node);
-  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac, imageLabel);
+  const { ringFrac, barFrac, vaeFrac, vaeActive, imageLabel } = fractionsFor(node);
+  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac, vaeFrac, vaeActive, imageLabel);
 }
 
 function buildVueFace(node) {
@@ -470,6 +534,7 @@ app.registerExtension({
       this._odai_progress = null;
       this._odai_nodeStates = null;
       this._odai_currentNodeId = null;
+      this._odai_vaeNodeId = null;
       this._odai_barHighWater = 0;
       this._odai_barRunCount = 0;
       applyRenderer(this, isVueNodes());
@@ -497,7 +562,7 @@ app.registerExtension({
       const r0 = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
       if (!ctx || isVueNodes() || this.flags?.collapsed) return r0;
 
-      const { cx, cy, radius, bar, scale } = layoutFor(this.size[0], this.size[1]);
+      const { cx, cy, radius, bar1, bar2, scale } = layoutFor(this.size[0], this.size[1]);
       const color = nodeColorFor(this);
       const state = this._odai_state || "idle";
 
@@ -507,7 +572,7 @@ app.registerExtension({
       // disappear into an identically-colored body (reported 2026-10-31) —
       // the halo guarantees contrast regardless of what color is picked.
       ctx.save();
-      const { ringFrac, barFrac, imageLabel } = fractionsFor(this);
+      const { ringFrac, barFrac, vaeFrac, vaeActive, imageLabel } = fractionsFor(this);
 
       if (imageLabel) {
         // Inside the circle, not below it — a fixed outer margin already
@@ -522,29 +587,46 @@ app.registerExtension({
         ctx.fillText(imageLabel, cx, cy + radius * 0.6);
       }
 
-      // Bar is drawn in BOTH states — idle shows an empty 0% track, not just
-      // the running one, so it reads as a readout that's "there, at rest"
-      // rather than something that only appears mid-job.
-      if (bar) {
+      // Two bars, drawn in BOTH states — idle shows empty tracks, not just
+      // the running one, so they read as a readout that's "there, at rest"
+      // rather than something that only appears mid-job. "S" (sampler) is
+      // always live; "V" (VAE) only fills/shows a % once one has actually
+      // run this session — otherwise it's just a dim empty track + letter.
+      const drawBar = (b, frac, active, fillLabel) => {
+        if (!b) return;
         ctx.lineCap = "butt";
         ctx.fillStyle = "#000000";
-        ctx.fillRect(bar.x - 2, bar.top - 2, bar.w + 4, bar.h + 4);
+        ctx.fillRect(b.x - 2, b.top - 2, b.w + 4, b.h + 4);
 
         ctx.fillStyle = color + ALPHA_SUFFIX;
-        ctx.fillRect(bar.x, bar.top, bar.w, bar.h);
-        const filledH = bar.h * barFrac;
-        ctx.fillStyle = color;
-        ctx.fillRect(bar.x, bar.bottom - filledH, bar.w, filledH);
+        ctx.fillRect(b.x, b.top, b.w, b.h);
+        if (active) {
+          const filledH = b.h * frac;
+          ctx.fillStyle = color;
+          ctx.fillRect(b.x, b.bottom - filledH, b.w, filledH);
+        }
 
-        const pctLabel = Math.round(barFrac * 100) + "%";
-        ctx.font = `${Math.max(9, Math.round(13 * scale))}px sans-serif`;
+        const pctFont = Math.max(8, Math.round(11 * scale));
+        const letterFont = Math.max(7, Math.round(9 * scale));
+        const lw = Math.max(2, 2.5 * scale);
         ctx.textAlign = "center";
-        ctx.lineWidth = Math.max(2, 3 * scale);
+
+        const pctLabel = active ? Math.round(frac * 100) + "%" : fillLabel || "—";
+        ctx.font = `${pctFont}px sans-serif`;
+        ctx.lineWidth = lw;
         ctx.strokeStyle = "#000000";
-        ctx.strokeText(pctLabel, bar.x + bar.w / 2, bar.pctY);
+        ctx.strokeText(pctLabel, b.x + b.w / 2, b.pctY);
         ctx.fillStyle = "#ffffff";
-        ctx.fillText(pctLabel, bar.x + bar.w / 2, bar.pctY);
-      }
+        ctx.fillText(pctLabel, b.x + b.w / 2, b.pctY);
+
+        ctx.font = `${letterFont}px sans-serif`;
+        ctx.strokeStyle = "#000000";
+        ctx.strokeText(b.letter, b.x + b.w / 2, b.letterY);
+        ctx.fillStyle = color;
+        ctx.fillText(b.letter, b.x + b.w / 2, b.letterY);
+      };
+      drawBar(bar1, barFrac, true);
+      drawBar(bar2, vaeFrac, vaeActive);
 
       if (state === "running") {
         const lw = Math.max(3, radius * 0.14);
