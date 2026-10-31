@@ -58,65 +58,88 @@ function nodeColorFor(node) {
   return node.color || FALLBACK_COLOR;
 }
 
-// Circle + two optional vertical bars, all kept fully inside (w, h) and all
-// scaled to the node's own current size — a single scale factor tied to
-// min(w,h) (the original design) made the bars eat a near-fixed chunk of
-// width regardless of how big the node got, so a normal resize visibly
-// shrank the circle (reported 2026-10-31). Fixed by scaling the bar area
-// off WIDTH specifically (their own axis) and clamping it, so it claims a
-// shrinking proportion of width as the node grows instead of a fixed share
-// — the circle gets the benefit of extra width, not the bars.
+// Circle + a vertical "Sampler" bar beside it, + a horizontal "VAE" bar
+// spanning the bottom — all scaled to the node's own current size. Two
+// vertical bars side by side (the original design) left no room to spell
+// either word out; VAE moved to a horizontal strip specifically because a
+// horizontal bar has real width to put "VAE" next to, where a narrow
+// vertical one doesn't (user, 2026-10-31). A single scale factor tied to
+// min(w,h) also made the bar area eat a near-fixed chunk of width regardless
+// of how big the node got, visibly shrinking the circle on a normal resize
+// (reported same day) — fixed by scaling the bar area off WIDTH specifically
+// and clamping it, so it claims a shrinking proportion of width as the node
+// grows instead of a fixed share.
 const BAR_AREA_MIN = 50;
 const BAR_AREA_MAX = 170;
 const BAR_AREA_FRACTION = 0.26; // of node width, before clamping
 const MARGIN_MIN = 10;
 const MARGIN_MAX = 40;
-const MARGIN_FRACTION = 0.09; // of min(w, h), before clamping
-const MIN_SHOW_BAR_W = 100; // below this absolute width, hide the bars — no room even scaled down
-const MIN_SHOW_BAR_H = 70; // below this absolute height, same
+const MARGIN_FRACTION = 0.09; // of min(w, topH), before clamping
+const VAE_STRIP_MIN = 26;
+const VAE_STRIP_MAX = 60;
+const VAE_STRIP_FRACTION = 0.22; // of node height, before clamping
+const STRIP_GAP_MIN = 4;
+const STRIP_GAP_MAX = 14;
+const STRIP_GAP_FRACTION = 0.03; // of node height, before clamping
+const MIN_SHOW_BAR_W = 100; // below this absolute width, hide both bars — no room even scaled down
+const MIN_SHOW_BAR_H = 80; // below this absolute height, same
 
-// Two vertical bars: "S" = the sampler (or whichever node the ring is
-// currently on) — its own total progress, high-water smoothed so a restart
-// between passes doesn't saw backward. "V" = VAE encode/decode — detected
-// generically by INPUT TYPE ("VAE" on a node's own input slot, not any
-// class name — works for any pack's VAEDecode/VAEEncode/tiled/audio
-// variant), not shown filled until one actually runs (user, 2026-10-31:
-// "initialized after the sampler or when a decode or encode is happening").
+function clamp(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v));
+}
+
 function layoutFor(w, h) {
+  const showBars = w >= MIN_SHOW_BAR_W && h >= MIN_SHOW_BAR_H;
+  const vaeStripH = showBars ? clamp(h * VAE_STRIP_FRACTION, VAE_STRIP_MIN, VAE_STRIP_MAX) : 0;
+  const stripGap = showBars ? clamp(h * STRIP_GAP_FRACTION, STRIP_GAP_MIN, STRIP_GAP_MAX) : 0;
+  const topH = showBars ? Math.max(20, h - vaeStripH - stripGap) : h;
+
   // A fixed margin wasn't enough once the node was resized into a wide
   // rectangle: a radius of min(w,h)/2 leaves the ring tangent to the
   // shorter edge with zero clearance, so any rounding or the node's own
-  // border overflows it. MARGIN is subtracted from the SHORTER edge
-  // specifically to guarantee real clearance on every side.
-  const MARGIN = Math.min(MARGIN_MAX, Math.max(MARGIN_MIN, Math.min(w, h) * MARGIN_FRACTION));
-  const BAR_AREA = Math.min(BAR_AREA_MAX, Math.max(BAR_AREA_MIN, w * BAR_AREA_FRACTION));
+  // border overflows it. MARGIN is subtracted from the SHORTER edge of the
+  // circle's own region (width vs. topH, not the full node height once the
+  // VAE strip is carved off the bottom) specifically to guarantee real
+  // clearance on every side.
+  const MARGIN = clamp(Math.min(w, topH) * MARGIN_FRACTION, MARGIN_MIN, MARGIN_MAX);
+  const BAR_AREA = clamp(w * BAR_AREA_FRACTION, BAR_AREA_MIN, BAR_AREA_MAX);
+
+  const circleAreaW = showBars ? Math.max(10, w - BAR_AREA) : w;
+  const cx = circleAreaW / 2;
+  const cy = topH / 2;
+  const radius = Math.max(10, Math.min(circleAreaW, topH) / 2 - MARGIN);
   // Scale text/stroke weight off the circle's OWN eventual radius, not a
   // separate global factor — ties every drawn element's size directly to
-  // how big the circle actually ends up, which is what "resize relative to
-  // the node without killing the circle" means in practice.
-  const showBar = w >= MIN_SHOW_BAR_W && h >= MIN_SHOW_BAR_H;
-  const circleAreaW = showBar ? Math.max(10, w - BAR_AREA) : w;
-  const cx = circleAreaW / 2;
-  const cy = h / 2;
-  const radius = Math.max(10, Math.min(circleAreaW, h) / 2 - MARGIN);
+  // how big the circle actually ends up.
   const scale = Math.max(0.4, radius / 40); // 40 = a representative baseline radius for text/stroke sizing
-  const BAR_W = Math.min(BAR_AREA * 0.22, 26);
-  const BAR_GAP = Math.min(BAR_AREA * 0.1, 14);
 
-  let bar1 = null;
-  let bar2 = null;
-  if (showBar) {
+  let samplerBar = null;
+  let vaeBar = null;
+  if (showBars) {
+    const barW = Math.min(BAR_AREA * 0.45, 40);
     const top = MARGIN;
-    const bottom = h - MARGIN - 28 * scale; // room for the % line + letter line below each bar
-    const barH = Math.max(0, bottom - top);
-    const pctY = h - MARGIN - 12 * scale;
-    const letterY = h - MARGIN + 2 * scale;
-    const totalBarsW = BAR_W * 2 + BAR_GAP;
-    const startX = circleAreaW + (BAR_AREA - totalBarsW) / 2;
-    bar1 = { x: startX, w: BAR_W, top, bottom, h: barH, pctY, letterY, letter: "S" };
-    bar2 = { x: startX + BAR_W + BAR_GAP, w: BAR_W, top, bottom, h: barH, pctY, letterY, letter: "V" };
+    const bottom = topH - MARGIN - 26 * scale; // room for the % line + "Sampler" label below
+    samplerBar = {
+      x: circleAreaW + (BAR_AREA - barW) / 2,
+      w: barW,
+      top,
+      bottom,
+      h: Math.max(0, bottom - top),
+      pctY: topH - MARGIN - 12 * scale,
+      labelY: topH - MARGIN + 3 * scale,
+    };
+
+    const stripTop = topH + stripGap;
+    const stripBottom = h - MARGIN * 0.6;
+    vaeBar = {
+      x: MARGIN,
+      top: stripTop,
+      bottom: stripBottom,
+      w: Math.max(0, w - MARGIN * 2),
+      h: Math.max(0, stripBottom - stripTop),
+    };
   }
-  return { cx, cy, radius, bar1, bar2, scale };
+  return { cx, cy, radius, samplerBar, vaeBar, scale };
 }
 
 function nativeGroupUnderNode(node) {
@@ -437,53 +460,52 @@ function svgFace(color, state, ringFrac, barFrac, vaeFrac, vaeActive, imageLabel
   const rf = Math.max(0, Math.min(1, ringFrac));
   const bf = Math.max(0, Math.min(1, barFrac));
   const vf = Math.max(0, Math.min(1, vaeFrac));
-  const circumference = 2 * Math.PI * 40;
+  const circumference = 2 * Math.PI * 34;
   const dash = circumference * rf;
-  const barTop = 10, barBottom = 70, barH = barBottom - barTop;
+  const barTop = 6, barBottom = 62, barH = barBottom - barTop;
   const fillTop = barBottom - barH * bf;
-  const vaeFillTop = barBottom - barH * vf;
   const pct = Math.round(bf * 100);
-  const vaePct = vaeActive ? Math.round(vf * 100) + "%" : "—";
+  const vaeLabel = vaeActive ? `VAE ${Math.round(vf * 100)}%` : "VAE";
 
   const ringMarkup =
     state === "running"
-      ? `<circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
-         <circle cx="48" cy="50" r="40" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
-         <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"
+      ? `<circle cx="42" cy="42" r="34" fill="none" stroke="#000000" stroke-width="10"/>
+         <circle cx="42" cy="42" r="34" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="7"/>
+         <circle cx="42" cy="42" r="34" fill="none" stroke="${color}" stroke-width="7"
            stroke-dasharray="${dash} ${circumference}" stroke-linecap="round"
-           transform="rotate(-90 48 50)"/>
-         <line x1="35" y1="37" x2="61" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
-         <line x1="61" y1="37" x2="35" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
-         <line x1="35" y1="37" x2="61" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
-         <line x1="61" y1="37" x2="35" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>`
-      : `<circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
-         <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"/>
-         <path d="M 36 28 L 36 72 L 72 50 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
-         <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>`;
+           transform="rotate(-90 42 42)"/>
+         <line x1="30" y1="30" x2="54" y2="54" stroke="#000000" stroke-width="9" stroke-linecap="round"/>
+         <line x1="54" y1="30" x2="30" y2="54" stroke="#000000" stroke-width="9" stroke-linecap="round"/>
+         <line x1="30" y1="30" x2="54" y2="54" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>
+         <line x1="54" y1="30" x2="30" y2="54" stroke="#ffffff" stroke-width="6" stroke-linecap="round"/>`
+      : `<circle cx="42" cy="42" r="34" fill="none" stroke="#000000" stroke-width="10"/>
+         <circle cx="42" cy="42" r="34" fill="none" stroke="${color}" stroke-width="7"/>
+         <path d="M 31 24 L 31 60 L 62 42 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
+         <path d="M 31 24 L 31 60 L 62 42 Z" fill="${color}"/>`;
 
   const imageMarkup = imageLabel
-    ? `<text x="48" y="74" text-anchor="middle" font-size="9" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${imageLabel}</text>
-       <text x="48" y="74" text-anchor="middle" font-size="9" fill="#ffffff" font-family="sans-serif">${imageLabel}</text>`
+    ? `<text x="42" y="64" text-anchor="middle" font-size="8" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${imageLabel}</text>
+       <text x="42" y="64" text-anchor="middle" font-size="8" fill="#ffffff" font-family="sans-serif">${imageLabel}</text>`
     : "";
 
-  // Two bars: "S" (sampler, always live) and "V" (VAE encode/decode,
-  // generic — see isVaeNode — only filled once one has actually run).
-  return `<svg viewBox="0 0 160 100" width="100%" height="100%" style="display:block">
+  // "Sampler" (vertical, always live) beside the circle; "VAE" (horizontal,
+  // generic detection — see isVaeNode — filled only once one has actually
+  // run) spans the bottom, where there's real width to spell the word out.
+  return `<svg viewBox="0 0 100 92" width="100%" height="100%" style="display:block">
     ${ringMarkup}
-    <rect x="117" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
-    <rect x="118" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
-    <rect x="118" y="${fillTop}" width="12" height="${barH * bf}" rx="5" fill="${color}"/>
-    <text x="124" y="80" text-anchor="middle" font-size="11" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
-    <text x="124" y="80" text-anchor="middle" font-size="11" fill="#ffffff" font-family="sans-serif">${pct}%</text>
-    <text x="124" y="92" text-anchor="middle" font-size="8" fill="${color}" font-family="sans-serif" stroke="#000000" stroke-width="2" paint-order="stroke">S</text>
-
-    <rect x="139" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
-    <rect x="140" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
-    ${vaeActive ? `<rect x="140" y="${vaeFillTop}" width="12" height="${barH * vf}" rx="5" fill="${color}"/>` : ""}
-    <text x="146" y="80" text-anchor="middle" font-size="11" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${vaePct}</text>
-    <text x="146" y="80" text-anchor="middle" font-size="11" fill="#ffffff" font-family="sans-serif">${vaePct}</text>
-    <text x="146" y="92" text-anchor="middle" font-size="8" fill="${color}" font-family="sans-serif" stroke="#000000" stroke-width="2" paint-order="stroke">V</text>
+    <rect x="83" y="${barTop - 1}" width="12" height="${barH + 2}" rx="5" fill="#000000"/>
+    <rect x="84" y="${barTop}" width="10" height="${barH}" rx="4" fill="${color}${ALPHA_SUFFIX}"/>
+    <rect x="84" y="${fillTop}" width="10" height="${barH * bf}" rx="4" fill="${color}"/>
+    <text x="89" y="72" text-anchor="middle" font-size="9" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
+    <text x="89" y="72" text-anchor="middle" font-size="9" fill="#ffffff" font-family="sans-serif">${pct}%</text>
+    <text x="89" y="81" text-anchor="middle" font-size="6" fill="${color}" font-family="sans-serif" stroke="#000000" stroke-width="2" paint-order="stroke">Sampler</text>
     ${imageMarkup}
+
+    <rect x="3" y="76" width="94" height="14" rx="5" fill="#000000" opacity="0.5"/>
+    <rect x="4" y="77" width="92" height="12" rx="4" fill="${color}${ALPHA_SUFFIX}"/>
+    ${vaeActive ? `<rect x="4" y="77" width="${92 * vf}" height="12" rx="4" fill="${color}"/>` : ""}
+    <text x="50" y="86" text-anchor="middle" font-size="8" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${vaeLabel}</text>
+    <text x="50" y="86" text-anchor="middle" font-size="8" fill="#ffffff" font-family="sans-serif">${vaeLabel}</text>
   </svg>`;
 }
 
@@ -585,7 +607,7 @@ app.registerExtension({
       const r0 = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
       if (!ctx || isVueNodes() || this.flags?.collapsed) return r0;
 
-      const { cx, cy, radius, bar1, bar2, scale } = layoutFor(this.size[0], this.size[1]);
+      const { cx, cy, radius, samplerBar, vaeBar, scale } = layoutFor(this.size[0], this.size[1]);
       const color = nodeColorFor(this);
       const state = this._odai_state || "idle";
 
@@ -610,46 +632,66 @@ app.registerExtension({
         ctx.fillText(imageLabel, cx, cy + radius * 0.6);
       }
 
-      // Two bars, drawn in BOTH states — idle shows empty tracks, not just
+      // Both bars drawn in BOTH states — idle shows an empty track, not just
       // the running one, so they read as a readout that's "there, at rest"
-      // rather than something that only appears mid-job. "S" (sampler) is
-      // always live; "V" (VAE) only fills/shows a % once one has actually
-      // run this session — otherwise it's just a dim empty track + letter.
-      const drawBar = (b, frac, active, fillLabel) => {
-        if (!b) return;
+      // rather than something that only appears mid-job. Sampler is always
+      // live; VAE only fills/shows a % once one has actually run this
+      // session — otherwise it's just a dim empty track + the word "VAE".
+      if (samplerBar) {
+        const b = samplerBar;
         ctx.lineCap = "butt";
         ctx.fillStyle = "#000000";
         ctx.fillRect(b.x - 2, b.top - 2, b.w + 4, b.h + 4);
-
         ctx.fillStyle = color + ALPHA_SUFFIX;
         ctx.fillRect(b.x, b.top, b.w, b.h);
-        if (active) {
-          const filledH = b.h * frac;
-          ctx.fillStyle = color;
-          ctx.fillRect(b.x, b.bottom - filledH, b.w, filledH);
-        }
+        const filledH = b.h * barFrac;
+        ctx.fillStyle = color;
+        ctx.fillRect(b.x, b.bottom - filledH, b.w, filledH);
 
         const pctFont = Math.max(8, Math.round(11 * scale));
-        const letterFont = Math.max(7, Math.round(9 * scale));
-        const lw = Math.max(2, 2.5 * scale);
+        const labelFont = Math.max(7, Math.round(9 * scale));
         ctx.textAlign = "center";
+        ctx.lineWidth = Math.max(2, 2.5 * scale);
 
-        const pctLabel = active ? Math.round(frac * 100) + "%" : fillLabel || "—";
+        const pctLabel = Math.round(barFrac * 100) + "%";
         ctx.font = `${pctFont}px sans-serif`;
-        ctx.lineWidth = lw;
         ctx.strokeStyle = "#000000";
         ctx.strokeText(pctLabel, b.x + b.w / 2, b.pctY);
         ctx.fillStyle = "#ffffff";
         ctx.fillText(pctLabel, b.x + b.w / 2, b.pctY);
 
-        ctx.font = `${letterFont}px sans-serif`;
+        ctx.font = `${labelFont}px sans-serif`;
         ctx.strokeStyle = "#000000";
-        ctx.strokeText(b.letter, b.x + b.w / 2, b.letterY);
+        ctx.strokeText("Sampler", b.x + b.w / 2, b.labelY);
         ctx.fillStyle = color;
-        ctx.fillText(b.letter, b.x + b.w / 2, b.letterY);
-      };
-      drawBar(bar1, barFrac, true);
-      drawBar(bar2, vaeFrac, vaeActive);
+        ctx.fillText("Sampler", b.x + b.w / 2, b.labelY);
+      }
+
+      if (vaeBar) {
+        const b = vaeBar;
+        ctx.lineCap = "butt";
+        ctx.fillStyle = "#000000";
+        ctx.fillRect(b.x - 2, b.top - 2, b.w + 4, b.h + 4);
+        ctx.fillStyle = color + ALPHA_SUFFIX;
+        ctx.fillRect(b.x, b.top, b.w, b.h);
+        if (vaeActive) {
+          const filledW = b.w * vaeFrac;
+          ctx.fillStyle = color;
+          ctx.fillRect(b.x, b.top, filledW, b.h);
+        }
+
+        const label = vaeActive ? `VAE ${Math.round(vaeFrac * 100)}%` : "VAE";
+        const vaeFont = Math.max(9, Math.round(Math.min(b.h * 0.6, 14 * scale)));
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.font = `${vaeFont}px sans-serif`;
+        ctx.lineWidth = Math.max(2, 2.5 * scale);
+        ctx.strokeStyle = "#000000";
+        ctx.strokeText(label, b.x + b.w / 2, b.top + b.h / 2);
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText(label, b.x + b.w / 2, b.top + b.h / 2);
+        ctx.textBaseline = "alphabetic";
+      }
 
       if (state === "running") {
         const lw = Math.max(3, radius * 0.14);
