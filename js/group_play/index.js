@@ -166,6 +166,8 @@ function finishOwner() {
   const node = _owner;
   node._odai_state = "idle";
   node._odai_progress = null;
+  node._odai_totalIds = null;
+  node._odai_finishedIds = null;
   _owner = null;
   repaint(node);
 }
@@ -184,6 +186,26 @@ function installListenersOnce() {
     if (!_owner) return;
     const d = (e && e.detail) || {};
     _owner._odai_progress = { value: Number(d.value) || 0, max: Number(d.max) || 0 };
+    repaint(_owner);
+  });
+  // Whole-run total, separate from the ring's per-node step fraction above.
+  // Real backend event, not invented: comfy_execution/progress.py
+  // _send_progress_state sends { prompt_id, nodes: { id: {value,max,state,...} } }
+  // for every node touched so far (state: pending/running/finished/error);
+  // "pending" nodes are omitted until they start, so the fraction below is an
+  // approximation that only gets more accurate as the run proceeds and is
+  // exact at completion (the denominator stops growing once every node that
+  // will run has started at least once).
+  api.addEventListener("progress_state", (e) => {
+    if (!_owner) return;
+    const d = (e && e.detail) || {};
+    const nodes = d.nodes || {};
+    const seen = _owner._odai_totalIds || (_owner._odai_totalIds = new Set());
+    const done = _owner._odai_finishedIds || (_owner._odai_finishedIds = new Set());
+    for (const [id, st] of Object.entries(nodes)) {
+      seen.add(id);
+      if (st && st.state === "finished") done.add(id);
+    }
     repaint(_owner);
   });
   api.addEventListener("execution_success", finishOwner);
@@ -216,6 +238,8 @@ function queueGroup(node) {
 
   node._odai_state = "running";
   node._odai_progress = { value: 0, max: 0 };
+  node._odai_totalIds = new Set();
+  node._odai_finishedIds = new Set();
   _owner = node;
   repaint(node);
 
@@ -243,6 +267,17 @@ function cancelRun() {
   }
 }
 
+// Ring = current node's own step fraction (the "progress" event). Bar = whole
+// run so far (the "progress_state" event, see installListenersOnce).
+function fractionsFor(node) {
+  const p = node._odai_progress || { value: 0, max: 0 };
+  const ringFrac = p.max > 0 ? Math.max(0, Math.min(1, p.value / p.max)) : 0;
+  const total = node._odai_totalIds ? node._odai_totalIds.size : 0;
+  const done = node._odai_finishedIds ? node._odai_finishedIds.size : 0;
+  const barFrac = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
+  return { ringFrac, barFrac };
+}
+
 function handleClick(node) {
   const state = node._odai_state || "idle";
   if (state === "idle") queueGroup(node);
@@ -253,29 +288,43 @@ function handleClick(node) {
 // viewBox stays a fixed 140x100 (not square): a right-hand column for the
 // vertical progress bar + percentage, the rest for the circle. SVG's default
 // preserveAspectRatio keeps this proportional at any box size.
+//
+// Every shape is drawn TWICE: a black halo first, the accent color on top.
+// A node's right-click "solid color" option can set title and body to the
+// SAME hex (that's what "solid" means), which would make an accent-colored
+// shape disappear into an identically-colored body — reported 2026-10-31.
+// The halo guarantees contrast regardless of what single color is picked.
 function svgIdle(color) {
   return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
+    <circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
     <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"/>
+    <path d="M 36 28 L 36 72 L 72 50 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
     <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>
   </svg>`;
 }
 
-function svgRunning(color, frac) {
-  const f = Math.max(0, Math.min(1, frac));
+function svgRunning(color, ringFrac, barFrac) {
+  const rf = Math.max(0, Math.min(1, ringFrac));
+  const bf = Math.max(0, Math.min(1, barFrac));
   const circumference = 2 * Math.PI * 40;
-  const dash = circumference * f;
+  const dash = circumference * rf;
   const barTop = 10, barBottom = 82, barH = barBottom - barTop;
-  const fillTop = barBottom - barH * f;
-  const pct = Math.round(f * 100);
+  const fillTop = barBottom - barH * bf;
+  const pct = Math.round(bf * 100);
   return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
+    <circle cx="48" cy="50" r="40" fill="none" stroke="#000000" stroke-width="11"/>
     <circle cx="48" cy="50" r="40" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
     <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"
       stroke-dasharray="${dash} ${circumference}" stroke-linecap="round"
       transform="rotate(-90 48 50)"/>
+    <line x1="35" y1="37" x2="61" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
+    <line x1="61" y1="37" x2="35" y2="63" stroke="#000000" stroke-width="10" stroke-linecap="round"/>
     <line x1="35" y1="37" x2="61" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
     <line x1="61" y1="37" x2="35" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    <rect x="117" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
     <rect x="118" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
-    <rect x="118" y="${fillTop}" width="12" height="${barH * f}" rx="5" fill="${color}"/>
+    <rect x="118" y="${fillTop}" width="12" height="${barH * bf}" rx="5" fill="${color}"/>
+    <text x="124" y="95" text-anchor="middle" font-size="13" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
     <text x="124" y="95" text-anchor="middle" font-size="13" fill="#ffffff" font-family="sans-serif">${pct}%</text>
   </svg>`;
 }
@@ -285,9 +334,8 @@ function renderVueFace(node) {
   const color = nodeColorFor(node);
   const state = node._odai_state || "idle";
   if (state === "running") {
-    const p = node._odai_progress || { value: 0, max: 0 };
-    const frac = p.max > 0 ? p.value / p.max : 0;
-    node._odaiRoot.innerHTML = svgRunning(color, frac);
+    const { ringFrac, barFrac } = fractionsFor(node);
+    node._odaiRoot.innerHTML = svgRunning(color, ringFrac, barFrac);
   } else {
     node._odaiRoot.innerHTML = svgIdle(color);
   }
@@ -353,6 +401,8 @@ app.registerExtension({
       installListenersOnce();
       this._odai_state = "idle";
       this._odai_progress = null;
+      this._odai_totalIds = null;
+      this._odai_finishedIds = null;
       applyRenderer(this, isVueNodes());
       this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
@@ -382,14 +432,24 @@ app.registerExtension({
       const color = nodeColorFor(this);
       const state = this._odai_state || "idle";
 
+      // Every stroke/fill below is drawn twice: a black halo first, the
+      // accent color on top. A "solid color" node-color pick can set title
+      // and body to the SAME hex, which would make an accent-colored shape
+      // disappear into an identically-colored body (reported 2026-10-31) —
+      // the halo guarantees contrast regardless of what color is picked.
       ctx.save();
       if (state === "running") {
-        const p = this._odai_progress || { value: 0, max: 0 };
-        const frac = p.max > 0 ? Math.max(0, Math.min(1, p.value / p.max)) : 0;
+        const { ringFrac, barFrac } = fractionsFor(this);
+        const lw = Math.max(3, radius * 0.14);
 
         ctx.lineCap = "round";
-        ctx.lineWidth = Math.max(3, radius * 0.14);
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = lw + 4;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.stroke();
 
+        ctx.lineWidth = lw;
         ctx.strokeStyle = color + ALPHA_SUFFIX;
         ctx.beginPath();
         ctx.arc(cx, cy, radius, 0, Math.PI * 2);
@@ -397,12 +457,21 @@ app.registerExtension({
 
         ctx.strokeStyle = color;
         ctx.beginPath();
-        ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2);
+        ctx.arc(cx, cy, radius, -Math.PI / 2, -Math.PI / 2 + ringFrac * Math.PI * 2);
         ctx.stroke();
 
         const xr = radius * 0.32;
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = lw + 4;
+        ctx.beginPath();
+        ctx.moveTo(cx - xr, cy - xr);
+        ctx.lineTo(cx + xr, cy + xr);
+        ctx.moveTo(cx + xr, cy - xr);
+        ctx.lineTo(cx - xr, cy + xr);
+        ctx.stroke();
+
         ctx.strokeStyle = "#ffffff";
-        ctx.lineWidth = Math.max(3, radius * 0.14);
+        ctx.lineWidth = lw;
         ctx.beginPath();
         ctx.moveTo(cx - xr, cy - xr);
         ctx.lineTo(cx + xr, cy + xr);
@@ -412,32 +481,56 @@ app.registerExtension({
 
         if (bar) {
           ctx.lineCap = "butt";
+          ctx.fillStyle = "#000000";
+          ctx.fillRect(bar.x - 2, bar.top - 2, bar.w + 4, bar.h + 4);
+
           ctx.fillStyle = color + ALPHA_SUFFIX;
           ctx.fillRect(bar.x, bar.top, bar.w, bar.h);
-          const filledH = bar.h * frac;
+          const filledH = bar.h * barFrac;
           ctx.fillStyle = color;
           ctx.fillRect(bar.x, bar.bottom - filledH, bar.w, filledH);
 
-          ctx.fillStyle = "#ffffff";
+          const label = Math.round(barFrac * 100) + "%";
           ctx.font = "13px sans-serif";
           ctx.textAlign = "center";
-          ctx.fillText(Math.round(frac * 100) + "%", bar.x + bar.w / 2, bar.labelY);
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = "#000000";
+          ctx.strokeText(label, bar.x + bar.w / 2, bar.labelY);
+          ctx.fillStyle = "#ffffff";
+          ctx.fillText(label, bar.x + bar.w / 2, bar.labelY);
         }
       } else {
-        ctx.lineWidth = Math.max(2, radius * 0.08);
+        const lw = Math.max(2, radius * 0.08);
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = lw + 4;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.stroke();
+
         ctx.strokeStyle = color;
+        ctx.lineWidth = lw;
         ctx.beginPath();
         ctx.arc(cx, cy, radius, 0, Math.PI * 2);
         ctx.stroke();
 
         const tri = radius * 0.78;
         const offset = radius * 0.12;
+        const triPath = () => {
+          ctx.beginPath();
+          ctx.moveTo(cx - tri / 2 + offset, cy - tri * 0.62);
+          ctx.lineTo(cx - tri / 2 + offset, cy + tri * 0.62);
+          ctx.lineTo(cx + tri * 0.7 + offset, cy);
+          ctx.closePath();
+        };
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = 4;
+        triPath();
+        ctx.stroke();
+        ctx.fillStyle = "#000000";
+        triPath();
+        ctx.fill();
         ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.moveTo(cx - tri / 2 + offset, cy - tri * 0.62);
-        ctx.lineTo(cx - tri / 2 + offset, cy + tri * 0.62);
-        ctx.lineTo(cx + tri * 0.7 + offset, cy);
-        ctx.closePath();
+        triPath();
         ctx.fill();
       }
       ctx.restore();
