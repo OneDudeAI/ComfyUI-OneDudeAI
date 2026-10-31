@@ -78,16 +78,8 @@ function layoutFor(w, h) {
   if (showBar) {
     const barX = circleAreaW + (BAR_AREA - BAR_W) / 2;
     const top = MARGIN;
-    const bottom = h - MARGIN - 34; // room for two label lines below the bar
-    bar = {
-      x: barX,
-      w: BAR_W,
-      top,
-      bottom,
-      h: Math.max(0, bottom - top),
-      pctY: h - MARGIN - 16, // percentage line
-      posY: h - MARGIN + 2, // "N of X" line
-    };
+    const bottom = h - MARGIN - 18; // room for the % label below the bar
+    bar = { x: barX, w: BAR_W, top, bottom, h: Math.max(0, bottom - top), pctY: h - MARGIN + 2 };
   }
   return { cx, cy, radius, bar };
 }
@@ -175,8 +167,6 @@ function finishOwner() {
   node._odai_state = "idle";
   node._odai_progress = null;
   node._odai_nodeStates = null;
-  node._odai_queueTotal = null;
-  node._odai_queueRemaining = null;
   _owner = null;
   repaint(node);
 }
@@ -222,29 +212,6 @@ function installListenersOnce() {
     }
     repaint(_owner);
   });
-  // Queue position ("N of X"). Real backend event: server.py get_queue_info /
-  // queue_updated send a status payload with exec_info.queue_remaining on
-  // every queue change — the frontend unwraps it before dispatch (detail is
-  // the status object itself, not {status: ...}) — same counter the native
-  // top bar's queue display reads.
-  // It's a single global remaining-count, not a list of job identities, so
-  // "X" is the remaining count first observed right after this node queued
-  // (treated as the starting total) and "N" counts down as that remaining
-  // count drops — exact for this node's own click, approximate if someone
-  // else queues more work on the server while this is running.
-  api.addEventListener("status", (e) => {
-    if (!_owner) return;
-    // detail IS the status object already — server.py sends {sid?, status},
-    // and the frontend's own WS handler dispatches detail = data.status
-    // directly (confirmed in api-*.js: dispatchCustomEvent("status",
-    // t.data.status ?? null)) — there is no extra .status wrapper here.
-    const d = (e && e.detail) || {};
-    const remaining = d.exec_info?.queue_remaining;
-    if (typeof remaining !== "number") return;
-    if (_owner._odai_queueTotal == null) _owner._odai_queueTotal = Math.max(remaining, 1);
-    _owner._odai_queueRemaining = remaining;
-    repaint(_owner);
-  });
   api.addEventListener("execution_success", finishOwner);
   api.addEventListener("execution_error", finishOwner);
   api.addEventListener("execution_interrupted", finishOwner);
@@ -276,8 +243,6 @@ function queueGroup(node) {
   node._odai_state = "running";
   node._odai_progress = { value: 0, max: 0 };
   node._odai_nodeStates = new Map();
-  node._odai_queueTotal = null;
-  node._odai_queueRemaining = null;
   _owner = node;
   repaint(node);
 
@@ -322,15 +287,7 @@ function fractionsFor(node) {
     barFrac = Math.max(0, Math.min(1, sum / states.size));
   }
 
-  let queueLabel = null;
-  const qTotal = node._odai_queueTotal;
-  const qRemaining = node._odai_queueRemaining;
-  if (qTotal != null && qRemaining != null) {
-    const remaining = Math.max(0, Math.min(qTotal, qRemaining));
-    const position = Math.max(1, Math.min(qTotal, qTotal - remaining + 1));
-    queueLabel = `${position} of ${qTotal}`;
-  }
-  return { ringFrac, barFrac, queueLabel };
+  return { ringFrac, barFrac };
 }
 
 function handleClick(node) {
@@ -351,9 +308,8 @@ function handleClick(node) {
 // The halo guarantees contrast regardless of what single color is picked.
 // Bar is drawn in BOTH states — idle shows an empty 0% track so it reads
 // as a readout that's "there, at rest", not something that only appears
-// mid-job. queueLabel ("N of X") is null/omitted when there's no queue
-// data yet (idle, or before the first "status" event of a run arrives).
-function svgFace(color, state, ringFrac, barFrac, queueLabel) {
+// mid-job.
+function svgFace(color, state, ringFrac, barFrac) {
   const rf = Math.max(0, Math.min(1, ringFrac));
   const bf = Math.max(0, Math.min(1, barFrac));
   const circumference = 2 * Math.PI * 40;
@@ -378,11 +334,6 @@ function svgFace(color, state, ringFrac, barFrac, queueLabel) {
          <path d="M 36 28 L 36 72 L 72 50 Z" fill="#000000" stroke="#000000" stroke-width="4" stroke-linejoin="round"/>
          <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>`;
 
-  const queueMarkup = queueLabel
-    ? `<text x="124" y="92" text-anchor="middle" font-size="10" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${queueLabel}</text>
-       <text x="124" y="92" text-anchor="middle" font-size="10" fill="#ffffff" font-family="sans-serif">${queueLabel}</text>`
-    : "";
-
   return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
     ${ringMarkup}
     <rect x="117" y="${barTop - 1}" width="14" height="${barH + 2}" rx="6" fill="#000000"/>
@@ -390,7 +341,6 @@ function svgFace(color, state, ringFrac, barFrac, queueLabel) {
     <rect x="118" y="${fillTop}" width="12" height="${barH * bf}" rx="5" fill="${color}"/>
     <text x="124" y="80" text-anchor="middle" font-size="12" fill="#000000" font-family="sans-serif" stroke="#000000" stroke-width="3" paint-order="stroke">${pct}%</text>
     <text x="124" y="80" text-anchor="middle" font-size="12" fill="#ffffff" font-family="sans-serif">${pct}%</text>
-    ${queueMarkup}
   </svg>`;
 }
 
@@ -398,8 +348,8 @@ function renderVueFace(node) {
   if (!node._odaiRoot) return;
   const color = nodeColorFor(node);
   const state = node._odai_state || "idle";
-  const { ringFrac, barFrac, queueLabel } = fractionsFor(node);
-  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac, queueLabel);
+  const { ringFrac, barFrac } = fractionsFor(node);
+  node._odaiRoot.innerHTML = svgFace(color, state, ringFrac, barFrac);
 }
 
 function buildVueFace(node) {
@@ -463,8 +413,6 @@ app.registerExtension({
       this._odai_state = "idle";
       this._odai_progress = null;
       this._odai_nodeStates = null;
-      this._odai_queueTotal = null;
-      this._odai_queueRemaining = null;
       applyRenderer(this, isVueNodes());
       this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
@@ -500,7 +448,7 @@ app.registerExtension({
       // disappear into an identically-colored body (reported 2026-10-31) —
       // the halo guarantees contrast regardless of what color is picked.
       ctx.save();
-      const { ringFrac, barFrac, queueLabel } = fractionsFor(this);
+      const { ringFrac, barFrac } = fractionsFor(this);
 
       // Bar is drawn in BOTH states — idle shows an empty 0% track, not just
       // the running one, so it reads as a readout that's "there, at rest"
@@ -524,15 +472,6 @@ app.registerExtension({
         ctx.strokeText(pctLabel, bar.x + bar.w / 2, bar.pctY);
         ctx.fillStyle = "#ffffff";
         ctx.fillText(pctLabel, bar.x + bar.w / 2, bar.pctY);
-
-        if (queueLabel) {
-          ctx.font = "11px sans-serif";
-          ctx.strokeStyle = "#000000";
-          ctx.lineWidth = 3;
-          ctx.strokeText(queueLabel, bar.x + bar.w / 2, bar.posY);
-          ctx.fillStyle = "#ffffff";
-          ctx.fillText(queueLabel, bar.x + bar.w / 2, bar.posY);
-        }
       }
 
       if (state === "running") {
