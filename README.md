@@ -16,6 +16,8 @@ live, no color picker of its own).
   currently executing, not provably just this group (ComfyUI has no
   per-group cancel). Fine for single-job use.
 
-v1 is canvas-renderer only (matches the live install's
-`Comfy.VueNodes.Enabled = False`); it won't draw its face in the Vue
-"Nodes 2.0" renderer yet.
+Works in both renderers, and rebuilds live if you flip ComfyUI's
+"Modern Node Design (Nodes 2.0)" setting mid-session (no page reload
+needed) — same renderer-switch handling Pixaroma's own nodes use. Classic
+paints the circle on the node's own canvas; Nodes 2.0 gets an inline-SVG
+DOM widget instead, since that renderer never calls `onDrawForeground`.

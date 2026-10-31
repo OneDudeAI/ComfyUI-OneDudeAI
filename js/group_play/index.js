@@ -1,5 +1,9 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
+import { isVueNodes } from "../shared/nodes2.mjs";
+import { onRendererChange } from "../shared/renderer_switch.mjs";
+import { removeNodeWidget } from "../shared/remove_widget.mjs";
+import { installCanvasZoomPassthrough } from "../shared/canvas_zoom.mjs";
 
 // OneDudeAI — Group Play
 // A resizable node you drop inside a group. Idle: a play circle (colored to
@@ -11,25 +15,32 @@ import { api } from "../../../scripts/api.js";
 // every member whose constructor.nodeData.output_node is true). While that
 // run is live the circle becomes a progress ring with a cancel "X" in the
 // center; the X calls api.interrupt() — ComfyUI only has ONE global
-// interrupt (confirmed: every local pack that cancels a run, e.g.
-// comfyui-vrgamedevgirl/web/music_video_builder/comfy_api.mjs, obvpm-timeline
-// h3_tl_jobs.js, calls the same POST /interrupt with no per-node scoping), so
-// the X stops whatever is currently executing, not provably just this
-// group's job. In normal single-job use that's the same thing.
+// interrupt (confirmed: every local pack that cancels a run calls the same
+// POST /interrupt with no per-node scoping), so the X stops whatever is
+// currently executing, not provably just this group's job. In normal
+// single-job use that's the same thing.
 //
-// Canvas-only for v1: the live D install has Comfy.VueNodes.Enabled = False
-// (read from /api/settings), i.e. the classic LiteGraph renderer. In the
-// Vue "Nodes 2.0" renderer, onDrawForeground/onMouseDown are skipped
-// entirely (confirmed from ComfyUI-Pixaroma/js/monitor/index.js, which ships
-// a whole separate DOM-widget face for that case) — this node intentionally
-// does not build one yet, so it is inert there until that's added.
+// Works in both renderers, built the way every title-less Pixaroma node
+// does it (recipe read in full from ComfyUI-Pixaroma/js/monitor/index.js):
+//   • Classic: no DOM widget — the face is painted straight onto the node's
+//     own canvas in onDrawForeground, so LiteGraph keeps the drag/resize.
+//   • Nodes 2.0 (Vue): onDrawForeground/onMouseDown are never called, so a
+//     DOM widget (addDOMWidget) carries an inline SVG face instead, built
+//     once and live-rebuilt on click.
+//   • A node that picks its UI once, at construction, is left holding the
+//     wrong one if the renderer is flipped without a page reload (that's
+//     a real, reported Pixaroma bug, not a hypothetical) — so this also
+//     subscribes to the live renderer-change poll and rebuilds its face on
+//     a flip, same as Monitor/Switch/Label do.
+//
+// Not ported from Pixaroma for v1: its resize-floor / persisted-scale
+// system. That exists to keep Monitor's generated TEXT legible at a
+// Vue-forced minimum height; a plain circle has no such floor, so normal
+// node resize (both renderers) is left to size it.
 
 const FALLBACK_COLOR = "#f66744"; // Pixaroma orange — only used when the node isn't inside a group
 const DEFAULT_SIZE = [120, 120];
-
-function isVueNodes() {
-  return !!window.LiteGraph?.vueNodesMode;
-}
+const ALPHA_SUFFIX = "40"; // ~25% alpha, appended to a hex color string
 
 function toast(severity, summary, detail) {
   try {
@@ -79,6 +90,11 @@ function isOutputNode(n) {
   );
 }
 
+function repaint(node) {
+  app.canvas?.setDirty?.(true, true); // harmless no-op in Nodes 2.0
+  if (node?._odaiRoot) renderVueFace(node);
+}
+
 // ── one shared "who is running" slot for every GroupPlay node ─────────────
 // v1 limitation (documented, not hidden): there's one slot. If you press
 // Play on a second GroupPlay node before the first run finishes, the ring
@@ -90,10 +106,11 @@ let _listenersInstalled = false;
 
 function finishOwner() {
   if (!_owner) return;
-  _owner._odai_state = "idle";
-  _owner._odai_progress = null;
+  const node = _owner;
+  node._odai_state = "idle";
+  node._odai_progress = null;
   _owner = null;
-  app.canvas?.setDirty?.(true, true);
+  repaint(node);
 }
 
 function installListenersOnce() {
@@ -104,13 +121,13 @@ function installListenersOnce() {
     const d = e && e.detail;
     const runningId = d && typeof d === "object" ? d.node : d;
     if (runningId == null) finishOwner();
-    else app.canvas?.setDirty?.(true, true);
+    else if (_owner) repaint(_owner);
   });
   api.addEventListener("progress", (e) => {
     if (!_owner) return;
     const d = (e && e.detail) || {};
     _owner._odai_progress = { value: Number(d.value) || 0, max: Number(d.max) || 0 };
-    app.canvas?.setDirty?.(true, true);
+    repaint(_owner);
   });
   api.addEventListener("execution_success", finishOwner);
   api.addEventListener("execution_error", finishOwner);
@@ -143,7 +160,7 @@ function queueGroup(node) {
   node._odai_state = "running";
   node._odai_progress = { value: 0, max: 0 };
   _owner = node;
-  app.canvas?.setDirty?.(true, true);
+  repaint(node);
 
   try {
     const r = app.queuePrompt(0, 1, ids);
@@ -169,6 +186,86 @@ function cancelRun() {
   }
 }
 
+function handleClick(node) {
+  const state = node._odai_state || "idle";
+  if (state === "idle") queueGroup(node);
+  else if (state === "running") cancelRun();
+}
+
+// ── Nodes 2.0 (Vue) face: an inline SVG DOM widget ─────────────────────────
+function svgIdle(color) {
+  return `<svg viewBox="0 0 100 100" width="100%" height="100%" style="display:block">
+    <circle cx="50" cy="50" r="42" fill="none" stroke="${color}" stroke-width="8"/>
+    <path d="M 38 28 L 38 72 L 74 50 Z" fill="${color}"/>
+  </svg>`;
+}
+
+function svgRunning(color, frac) {
+  const circumference = 2 * Math.PI * 42;
+  const dash = circumference * Math.max(0, Math.min(1, frac));
+  return `<svg viewBox="0 0 100 100" width="100%" height="100%" style="display:block">
+    <circle cx="50" cy="50" r="42" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
+    <circle cx="50" cy="50" r="42" fill="none" stroke="${color}" stroke-width="8"
+      stroke-dasharray="${dash} ${circumference}" stroke-linecap="round"
+      transform="rotate(-90 50 50)"/>
+    <line x1="35" y1="35" x2="65" y2="65" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
+    <line x1="65" y1="35" x2="35" y2="65" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
+  </svg>`;
+}
+
+function renderVueFace(node) {
+  if (!node._odaiRoot) return;
+  const color = groupColorFor(node);
+  const state = node._odai_state || "idle";
+  if (state === "running") {
+    const p = node._odai_progress || { value: 0, max: 0 };
+    const frac = p.max > 0 ? p.value / p.max : 0;
+    node._odaiRoot.innerHTML = svgRunning(color, frac);
+  } else {
+    node._odaiRoot.innerHTML = svgIdle(color);
+  }
+}
+
+function buildVueFace(node) {
+  if (node._odaiRoot) return;
+  const root = document.createElement("div");
+  root.style.cssText =
+    "width:100%;height:100%;min-width:40px;min-height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;";
+  root.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    handleClick(node);
+  });
+  node._odaiRoot = root;
+  node._odaiZoomOff = installCanvasZoomPassthrough(root);
+
+  const widget = node.addDOMWidget("odai_group_play", "onedudeai_group_play", root, {
+    getValue: () => null,
+    setValue: () => {},
+    getMinHeight: () => 40,
+    serialize: false,
+  });
+  node._odaiWidget = widget;
+  widget.computeLayoutSize = () => ({ minHeight: 40, minWidth: 40 });
+  renderVueFace(node);
+}
+
+function teardownVueFace(node) {
+  try {
+    node._odaiZoomOff?.();
+  } catch (_e) {
+    /* best-effort */
+  }
+  node._odaiZoomOff = null;
+  removeNodeWidget(node, node._odaiWidget);
+  node._odaiWidget = null;
+  node._odaiRoot = null;
+}
+
+function applyRenderer(node, vue) {
+  if (vue) buildVueFace(node);
+  else teardownVueFace(node);
+}
+
 app.registerExtension({
   name: "OneDudeAI.GroupPlay",
   async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -189,9 +286,26 @@ app.registerExtension({
       installListenersOnce();
       this._odai_state = "idle";
       this._odai_progress = null;
+      applyRenderer(this, isVueNodes());
+      this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
     };
 
+    const onRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function () {
+      try {
+        this._odaiRendererOff?.();
+      } catch (_e) {
+        /* best-effort */
+      }
+      this._odaiRendererOff = null;
+      if (_owner === this) _owner = null;
+      teardownVueFace(this);
+      return onRemoved ? onRemoved.apply(this, arguments) : undefined;
+    };
+
+    // Classic only: Nodes 2.0 never calls onDrawForeground, its DOM face
+    // renders instead (confirmed: ComfyUI-Pixaroma/js/monitor/index.js:576).
     const onDrawForeground = nodeType.prototype.onDrawForeground;
     nodeType.prototype.onDrawForeground = function (ctx) {
       const r0 = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
@@ -213,7 +327,7 @@ app.registerExtension({
         ctx.lineCap = "round";
         ctx.lineWidth = Math.max(3, radius * 0.14);
 
-        ctx.strokeStyle = color + "40";
+        ctx.strokeStyle = color + ALPHA_SUFFIX;
         ctx.beginPath();
         ctx.arc(cx, cy, radius, 0, Math.PI * 2);
         ctx.stroke();
@@ -265,9 +379,7 @@ app.registerExtension({
       const dx = pos[0] - cx;
       const dy = pos[1] - cy;
       if (Math.hypot(dx, dy) <= radius) {
-        const state = this._odai_state || "idle";
-        if (state === "idle") queueGroup(this);
-        else if (state === "running") cancelRun();
+        handleClick(this);
         return true;
       }
       return onMouseDown ? onMouseDown.apply(this, arguments) : false;
