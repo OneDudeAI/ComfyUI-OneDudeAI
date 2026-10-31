@@ -58,18 +58,22 @@ function nodeColorFor(node) {
   return node.color || FALLBACK_COLOR;
 }
 
-// Circle + optional vertical progress bar, both kept fully inside (w, h),
-// and both scaled to the node's own size — everything below was a fixed
-// pixel count regardless of how big the node was resized, so the bar/text
-// stayed small on a large node (reported 2026-10-31). BASE_SIZE is the
-// node's own default size (DEFAULT_SIZE); every dimension below scales
-// off it, so a 2x bigger node gets a 2x bigger bar and 2x bigger text.
-const BASE_SIZE = 150;
-const BAR_AREA_BASE = 96; // width reserved on the right for both bars + labels
-const BAR_W_BASE = 14;
-const BAR_GAP_BASE = 10;
-const MARGIN_BASE = 18;
-const MIN_SHOW_BAR_W = 110; // below this absolute width, hide the bars — no room even scaled down
+// Circle + two optional vertical bars, all kept fully inside (w, h) and all
+// scaled to the node's own current size — a single scale factor tied to
+// min(w,h) (the original design) made the bars eat a near-fixed chunk of
+// width regardless of how big the node got, so a normal resize visibly
+// shrank the circle (reported 2026-10-31). Fixed by scaling the bar area
+// off WIDTH specifically (their own axis) and clamping it, so it claims a
+// shrinking proportion of width as the node grows instead of a fixed share
+// — the circle gets the benefit of extra width, not the bars.
+const BAR_AREA_MIN = 50;
+const BAR_AREA_MAX = 170;
+const BAR_AREA_FRACTION = 0.26; // of node width, before clamping
+const MARGIN_MIN = 10;
+const MARGIN_MAX = 40;
+const MARGIN_FRACTION = 0.09; // of min(w, h), before clamping
+const MIN_SHOW_BAR_W = 100; // below this absolute width, hide the bars — no room even scaled down
+const MIN_SHOW_BAR_H = 70; // below this absolute height, same
 
 // Two vertical bars: "S" = the sampler (or whichever node the ring is
 // currently on) — its own total progress, high-water smoothed so a restart
@@ -84,17 +88,20 @@ function layoutFor(w, h) {
   // shorter edge with zero clearance, so any rounding or the node's own
   // border overflows it. MARGIN is subtracted from the SHORTER edge
   // specifically to guarantee real clearance on every side.
-  const scale = Math.max(0.4, Math.min(w, h) / BASE_SIZE);
-  const MARGIN = MARGIN_BASE * scale;
-  const BAR_AREA = BAR_AREA_BASE * scale;
-  const BAR_W = BAR_W_BASE * scale;
-  const BAR_GAP = BAR_GAP_BASE * scale;
-
-  const showBar = w >= MIN_SHOW_BAR_W;
+  const MARGIN = Math.min(MARGIN_MAX, Math.max(MARGIN_MIN, Math.min(w, h) * MARGIN_FRACTION));
+  const BAR_AREA = Math.min(BAR_AREA_MAX, Math.max(BAR_AREA_MIN, w * BAR_AREA_FRACTION));
+  // Scale text/stroke weight off the circle's OWN eventual radius, not a
+  // separate global factor — ties every drawn element's size directly to
+  // how big the circle actually ends up, which is what "resize relative to
+  // the node without killing the circle" means in practice.
+  const showBar = w >= MIN_SHOW_BAR_W && h >= MIN_SHOW_BAR_H;
   const circleAreaW = showBar ? Math.max(10, w - BAR_AREA) : w;
   const cx = circleAreaW / 2;
   const cy = h / 2;
   const radius = Math.max(10, Math.min(circleAreaW, h) / 2 - MARGIN);
+  const scale = Math.max(0.4, radius / 40); // 40 = a representative baseline radius for text/stroke sizing
+  const BAR_W = Math.min(BAR_AREA * 0.22, 26);
+  const BAR_GAP = Math.min(BAR_AREA * 0.1, 14);
 
   let bar1 = null;
   let bar2 = null;
