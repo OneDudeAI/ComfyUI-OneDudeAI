@@ -206,8 +206,8 @@ function finishOwner() {
   node._odai_nodeStates = null;
   node._odai_currentNodeId = null;
   node._odai_vaeNodeId = null;
-  node._odai_barHighWater = 0;
-  node._odai_barRunCount = 0;
+  node._odai_totalNodes = 0;
+  node._odai_executedCount = 0;
   _owner = null;
   repaint(node);
 }
@@ -221,7 +221,18 @@ function installListenersOnce() {
     const runningId = d && typeof d === "object" ? d.node : d;
     if (runningId == null) finishOwner();
     else if (_owner) {
-      _owner._odai_currentNodeId = String(runningId);
+      const id = String(runningId);
+      // "S" bar total: the exact algorithm rgthree-comfy's own progress bar
+      // uses (prompt_service.ts / progress_bar.ts, read in full, confirmed
+      // 2026-10-31: percent = executedNodeIds.length / totalNodes * 100,
+      // where executedNodeIds grows by one each time "executing" reports a
+      // DIFFERENT node than before). No per-node-type logic, no multi-pass
+      // math — a node that cycles internally (KSampler across list passes)
+      // never changes id, so it doesn't inflate the count either.
+      if (_owner._odai_currentNodeId != null && _owner._odai_currentNodeId !== id) {
+        _owner._odai_executedCount = (_owner._odai_executedCount || 0) + 1;
+      }
+      _owner._odai_currentNodeId = id;
       repaint(_owner);
     }
   });
@@ -285,7 +296,7 @@ function installListenersOnce() {
   api.addEventListener("execution_interrupted", finishOwner);
 }
 
-function queueGroup(node) {
+async function queueGroup(node) {
   const bounds = groupBoundsUnderNode(node);
   if (!bounds) {
     toast("warn", "Not inside a group", "Drag this node fully inside a group, then press Play.");
@@ -313,10 +324,21 @@ function queueGroup(node) {
   node._odai_nodeStates = new Map();
   node._odai_currentNodeId = null;
   node._odai_vaeNodeId = null;
-  node._odai_barHighWater = 0;
-  node._odai_barRunCount = 0;
+  node._odai_totalNodes = 0;
+  node._odai_executedCount = 0;
   _owner = node;
   repaint(node);
+
+  try {
+    // Same resolved-prompt node count rgthree's own "Total" reads (see the
+    // "executing" listener above) — totalNodes from the FULL resolved
+    // prompt, not scoped to just this group's ids, matching their algorithm
+    // exactly rather than inventing a narrower variant of it.
+    const resolved = await app.graphToPrompt();
+    node._odai_totalNodes = Object.keys(resolved?.output || {}).length;
+  } catch (e) {
+    console.error("[OneDudeAI GroupPlay] could not resolve total node count", e);
+  }
 
   try {
     const r = app.queuePrompt(0, 1, ids);
@@ -345,13 +367,13 @@ function cancelRun() {
 // Ring = current node's own step fraction (the "progress" event, identical
 // to what KSampler itself reports). Bar used to average every touched node
 // together, but most of a chain (loaders, text nodes) runs once and sits at
-// 100% forever while only the sampler cycles — measured live, 2026-10-31:
-// that average barely moved, pinned around 70-80% the whole run. The bar now
-// tracks the SAME currently-running node as the ring, so it carries real
-// information: a high-water mark that only resets at an actual new pass
-// (confirmed live: a node's value genuinely drops on a restart, so a raw
-// per-tick read saws backward — the mark absorbs that), not a fake 0-100%
-// across an unknowable total.
+// 100% forever while only the sampler cycles — measured live, 2026-10-31.
+// The "S" bar now uses rgthree-comfy's own, proven algorithm instead (their
+// progress_bar.ts, read in full): percent = distinct nodes the run has
+// moved past / total nodes in the resolved prompt (app.graphToPrompt(),
+// called once at queue time — see queueGroup). Fully generic: no node-type
+// check, no assumed pass count, nothing invented — the exact metric their
+// native-looking "Total: X%" readout already shows.
 function fractionsFor(node) {
   const p = node._odai_progress || { value: 0, max: 0 };
   const ringFrac = p.max > 0 ? Math.max(0, Math.min(1, p.value / p.max)) : 0;
@@ -361,18 +383,12 @@ function fractionsFor(node) {
   const curState = curId && states ? states.get(curId) : null;
 
   // "Image N" — generic repeat count of whichever node is currently running.
-  // No assumed total: nothing in the system says ahead of time how many
-  // passes a batch will make.
   let imageLabel = null;
   if (curState && curState.runCount > 1) imageLabel = `Image ${curState.runCount}`;
 
-  if (node._odai_barRunCount !== (curState?.runCount || 0)) {
-    node._odai_barRunCount = curState?.runCount || 0;
-    node._odai_barHighWater = 0; // a genuinely new pass started — reset the mark
-  }
-  const rawFrac = curState?.max > 0 ? Math.max(0, Math.min(1, curState.value / curState.max)) : ringFrac;
-  const barFrac = Math.max(rawFrac, node._odai_barHighWater || 0);
-  node._odai_barHighWater = barFrac;
+  const total = node._odai_totalNodes || 0;
+  const executed = node._odai_executedCount || 0;
+  const barFrac = total > 0 ? Math.max(0, Math.min(1, executed / total)) : 0;
 
   // Second bar: VAE encode/decode, generic (see isVaeNode / the
   // progress_state handler). vaeActive stays false until one has actually
@@ -535,8 +551,8 @@ app.registerExtension({
       this._odai_nodeStates = null;
       this._odai_currentNodeId = null;
       this._odai_vaeNodeId = null;
-      this._odai_barHighWater = 0;
-      this._odai_barRunCount = 0;
+      this._odai_totalNodes = 0;
+      this._odai_executedCount = 0;
       applyRenderer(this, isVueNodes());
       this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
