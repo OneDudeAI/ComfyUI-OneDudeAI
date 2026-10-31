@@ -6,11 +6,15 @@ import { removeNodeWidget } from "../shared/remove_widget.mjs";
 import { installCanvasZoomPassthrough } from "../shared/canvas_zoom.mjs";
 
 // OneDudeAI — Group Play
-// A resizable node you drop inside a group. Idle: a play circle (colored to
-// match the group — set the group's color with Pixaroma's own "Group Colors"
-// right-click dialogue, this node just reads group.color live). Click it:
-// queues ONLY that group's output nodes via ComfyUI's own partial-execution
-// call, exactly like ComfyUI-Pixaroma's pixgroup module does
+// A resizable node you drop inside a group — either a native ComfyUI group
+// or one of Pixaroma's own pixgroup frames (app.graph.extra.pixaromaGroups —
+// a separate, non-native system; confirmed live 2026-10-31 that a plain
+// graph.getGroupOnPos miss there means nothing, Pixaroma groups don't show
+// up in it at all). Idle: a play circle, colored like every other Pixaroma
+// node — node.color, set with the standard right-click node color picker,
+// no group-color matching. Click it: queues ONLY that group's output nodes
+// via ComfyUI's own partial-execution call, exactly like ComfyUI-Pixaroma's
+// pixgroup module does
 // (js/pixgroup/index.js: app.queuePrompt(0, 1, ids), ids = String(node.id) of
 // every member whose constructor.nodeData.output_node is true). While that
 // run is live the circle becomes a progress ring with a cancel "X" in the
@@ -38,7 +42,7 @@ import { installCanvasZoomPassthrough } from "../shared/canvas_zoom.mjs";
 // Vue-forced minimum height; a plain circle has no such floor, so normal
 // node resize (both renderers) is left to size it.
 
-const FALLBACK_COLOR = "#f66744"; // Pixaroma orange — only used when the node isn't inside a group
+const FALLBACK_COLOR = "#f66744"; // Pixaroma orange — only used until the node's own color is set
 const DEFAULT_SIZE = [120, 120];
 const ALPHA_SUFFIX = "40"; // ~25% alpha, appended to a hex color string
 
@@ -50,7 +54,11 @@ function toast(severity, summary, detail) {
   }
 }
 
-function groupUnderNode(node) {
+function nodeColorFor(node) {
+  return node.color || FALLBACK_COLOR;
+}
+
+function nativeGroupUnderNode(node) {
   const graph = app.graph;
   if (!graph || typeof graph.getGroupOnPos !== "function") return null;
   const cx = node.pos[0] + node.size[0] / 2;
@@ -58,24 +66,47 @@ function groupUnderNode(node) {
   return graph.getGroupOnPos(cx, cy) || null;
 }
 
-function groupColorFor(node) {
-  const g = groupUnderNode(node);
-  return (g && g.color) || FALLBACK_COLOR;
+// Pixaroma's own group system: NOT a native LGraphGroup, so graph.getGroupOnPos
+// never sees it. Frames live at app.graph.extra.pixaromaGroups, an object of
+// {id, title, x, y, w, h} keyed 0..N (confirmed live, 2026-10-31).
+function pixgroupUnderNode(node) {
+  const pix = app.graph?.extra?.pixaromaGroups;
+  if (!pix || typeof pix !== "object") return null;
+  const cx = node.pos[0] + node.size[0] / 2;
+  const cy = node.pos[1] + node.size[1] / 2;
+  for (const key of Object.keys(pix)) {
+    const g = pix[key];
+    if (g && typeof g.x === "number" && cx >= g.x && cy >= g.y && cx <= g.x + g.w && cy <= g.y + g.h) {
+      return g;
+    }
+  }
+  return null;
+}
+
+// Normalized {x, y, w, h} bounds for whichever group system the node sits
+// in, native checked first. `native` carries the real LGraphGroup instance
+// when there is one, so queueGroup can call its own recomputeInsideNodes.
+function groupBoundsUnderNode(node) {
+  const ng = nativeGroupUnderNode(node);
+  if (ng) {
+    const pos = ng.pos || ng._pos || [0, 0];
+    const size = ng.size || ng._size || [0, 0];
+    return { x: pos[0], y: pos[1], w: size[0], h: size[1], native: ng };
+  }
+  const pg = pixgroupUnderNode(node);
+  if (pg) return { x: pg.x, y: pg.y, w: pg.w, h: pg.h, native: null };
+  return null;
 }
 
 // Explicit bounding-box containment — does not depend on reading any other
 // pack's private member-list cache.
-function groupMemberNodes(group) {
+function groupMemberNodes(bounds) {
   const nodes = (app.graph && app.graph._nodes) || [];
-  const gx = (group.pos || group._pos || [0, 0])[0];
-  const gy = (group.pos || group._pos || [0, 0])[1];
-  const gw = (group.size || group._size || [0, 0])[0];
-  const gh = (group.size || group._size || [0, 0])[1];
   return nodes.filter((n) => {
     if (!n || !n.pos || !n.size) return false;
     const [nx, ny] = n.pos;
     const [nw, nh] = n.size;
-    return nx >= gx && ny >= gy && nx + nw <= gx + gw && ny + nh <= gy + gh;
+    return nx >= bounds.x && ny >= bounds.y && nx + nw <= bounds.x + bounds.w && ny + nh <= bounds.y + bounds.h;
   });
 }
 
@@ -135,17 +166,17 @@ function installListenersOnce() {
 }
 
 function queueGroup(node) {
-  const group = groupUnderNode(node);
-  if (!group) {
+  const bounds = groupBoundsUnderNode(node);
+  if (!bounds) {
     toast("warn", "Not inside a group", "Drag this node fully inside a group, then press Play.");
     return;
   }
   try {
-    group.recomputeInsideNodes?.();
+    bounds.native?.recomputeInsideNodes?.();
   } catch (_e) {
     /* best-effort refresh only */
   }
-  const members = groupMemberNodes(group).filter((n) => n !== node);
+  const members = groupMemberNodes(bounds).filter((n) => n !== node);
   const outs = members.filter(isOutputNode);
   if (!outs.length) {
     toast(
@@ -215,7 +246,7 @@ function svgRunning(color, frac) {
 
 function renderVueFace(node) {
   if (!node._odaiRoot) return;
-  const color = groupColorFor(node);
+  const color = nodeColorFor(node);
   const state = node._odai_state || "idle";
   if (state === "running") {
     const p = node._odai_progress || { value: 0, max: 0 };
@@ -316,7 +347,7 @@ app.registerExtension({
       const cx = w / 2;
       const cy = h / 2;
       const radius = Math.max(10, Math.min(w, h) / 2 - 6);
-      const color = groupColorFor(this);
+      const color = nodeColorFor(this);
       const state = this._odai_state || "idle";
 
       ctx.save();
