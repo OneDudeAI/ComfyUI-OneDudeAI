@@ -58,18 +58,30 @@ function nodeColorFor(node) {
   return node.color || FALLBACK_COLOR;
 }
 
-// Circle + optional vertical progress bar, both kept fully inside (w, h).
-// A fixed margin wasn't enough once the node was resized into a wide
-// rectangle (screenshot, 2026-10-31): a radius of min(w,h)/2 leaves the
-// ring tangent to the shorter edge with zero clearance, so any rounding or
-// the node's own border overflows it. MARGIN is subtracted from the
-// SHORTER edge specifically to guarantee real clearance on every side.
-const BAR_AREA = 56; // width reserved on the right for the bar + its % label
-const BAR_W = 16;
-const MARGIN = 18;
+// Circle + optional vertical progress bar, both kept fully inside (w, h),
+// and both scaled to the node's own size — everything below was a fixed
+// pixel count regardless of how big the node was resized, so the bar/text
+// stayed small on a large node (reported 2026-10-31). BASE_SIZE is the
+// node's own default size (DEFAULT_SIZE); every dimension below scales
+// off it, so a 2x bigger node gets a 2x bigger bar and 2x bigger text.
+const BASE_SIZE = 150;
+const BAR_AREA_BASE = 56; // width reserved on the right for the bar + its % label
+const BAR_W_BASE = 16;
+const MARGIN_BASE = 18;
+const MIN_SHOW_BAR_W = 80; // below this absolute width, hide the bar — no room even scaled down
 
 function layoutFor(w, h) {
-  const showBar = w >= 150;
+  // A fixed margin wasn't enough once the node was resized into a wide
+  // rectangle: a radius of min(w,h)/2 leaves the ring tangent to the
+  // shorter edge with zero clearance, so any rounding or the node's own
+  // border overflows it. MARGIN is subtracted from the SHORTER edge
+  // specifically to guarantee real clearance on every side.
+  const scale = Math.max(0.4, Math.min(w, h) / BASE_SIZE);
+  const MARGIN = MARGIN_BASE * scale;
+  const BAR_AREA = BAR_AREA_BASE * scale;
+  const BAR_W = BAR_W_BASE * scale;
+
+  const showBar = w >= MIN_SHOW_BAR_W;
   const circleAreaW = showBar ? Math.max(10, w - BAR_AREA) : w;
   const cx = circleAreaW / 2;
   const cy = h / 2;
@@ -78,10 +90,10 @@ function layoutFor(w, h) {
   if (showBar) {
     const barX = circleAreaW + (BAR_AREA - BAR_W) / 2;
     const top = MARGIN;
-    const bottom = h - MARGIN - 18; // room for the % label below the bar
-    bar = { x: barX, w: BAR_W, top, bottom, h: Math.max(0, bottom - top), pctY: h - MARGIN + 2 };
+    const bottom = h - MARGIN - 18 * scale; // room for the % label below the bar
+    bar = { x: barX, w: BAR_W, top, bottom, h: Math.max(0, bottom - top), pctY: h - MARGIN + 2 * scale };
   }
-  return { cx, cy, radius, bar };
+  return { cx, cy, radius, bar, scale };
 }
 
 function nativeGroupUnderNode(node) {
@@ -168,6 +180,8 @@ function finishOwner() {
   node._odai_progress = null;
   node._odai_nodeStates = null;
   node._odai_currentNodeId = null;
+  node._odai_barHighWater = 0;
+  node._odai_barRunCount = 0;
   _owner = null;
   repaint(node);
 }
@@ -213,16 +227,20 @@ function installListenersOnce() {
     for (const [id, st] of Object.entries(nodes)) {
       if (!st) continue;
       const prev = states.get(id);
-      // A generic restart counter — any node that re-enters "running" after
-      // not being "running" has started another pass (how a list-expanded
-      // batch, e.g. a 20-line text box or PixaromaPromptEach, actually looks
-      // from here: the SAME node id re-executing, confirmed live — no id
-      // suffix per iteration). Counts whichever node the ring is currently
-      // on, whatever upstream mechanism produced the repeat; no node-type
-      // check anywhere (corrected 2026-10-31 after hardcoding PromptEach).
+      const value = Number(st.value) || 0;
+      // A generic restart counter for a list-expanded batch (a 20-line text
+      // box, PixaromaPromptEach, anything — the SAME node id re-executes,
+      // confirmed live, no id suffix per pass). Originally watched for
+      // finished→running, which never fires: watched LIVE through a real
+      // 5-pass run (2026-10-31) and KSampler's own state stayed "running"
+      // the entire time while its value cycled 14→1 five times — ComfyUI
+      // doesn't mark it "finished" between passes, only when the whole node
+      // is truly done. The real, confirmed signal is value DROPPING while
+      // still "running": that's a fresh pass starting over.
       let runCount = prev?.runCount || 0;
-      if (st.state === "running" && prev?.state !== "running") runCount += 1;
-      states.set(id, { value: Number(st.value) || 0, max: Number(st.max) || 0, state: st.state, runCount });
+      if (st.state === "running" && prev?.state === "running" && value < prev.value) runCount += 1;
+      else if (st.state === "running" && prev?.state !== "running") runCount += 1;
+      states.set(id, { value, max: Number(st.max) || 0, state: st.state, runCount });
     }
     repaint(_owner);
   });
@@ -258,6 +276,8 @@ function queueGroup(node) {
   node._odai_progress = { value: 0, max: 0 };
   node._odai_nodeStates = new Map();
   node._odai_currentNodeId = null;
+  node._odai_barHighWater = 0;
+  node._odai_barRunCount = 0;
   _owner = node;
   repaint(node);
 
@@ -285,30 +305,37 @@ function cancelRun() {
   }
 }
 
-// Ring = current node's own step fraction (the "progress" event). Bar = whole
-// run so far (the "progress_state" event, see installListenersOnce).
+// Ring = current node's own step fraction (the "progress" event, identical
+// to what KSampler itself reports). Bar used to average every touched node
+// together, but most of a chain (loaders, text nodes) runs once and sits at
+// 100% forever while only the sampler cycles — measured live, 2026-10-31:
+// that average barely moved, pinned around 70-80% the whole run. The bar now
+// tracks the SAME currently-running node as the ring, so it carries real
+// information: a high-water mark that only resets at an actual new pass
+// (confirmed live: a node's value genuinely drops on a restart, so a raw
+// per-tick read saws backward — the mark absorbs that), not a fake 0-100%
+// across an unknowable total.
 function fractionsFor(node) {
   const p = node._odai_progress || { value: 0, max: 0 };
   const ringFrac = p.max > 0 ? Math.max(0, Math.min(1, p.value / p.max)) : 0;
 
-  let barFrac = 0;
   const states = node._odai_nodeStates;
-  if (states && states.size > 0) {
-    let sum = 0;
-    for (const st of states.values()) {
-      if (st.state === "finished" || st.state === "error") sum += 1;
-      else if (st.state === "running") sum += st.max > 0 ? Math.max(0, Math.min(1, st.value / st.max)) : 0;
-    }
-    barFrac = Math.max(0, Math.min(1, sum / states.size));
-  }
-
-  // "Image N" — generic repeat count of whichever node is currently running
-  // (see the progress_state handler). No assumed total: nothing in the
-  // system says ahead of time how many passes a batch will make.
-  let imageLabel = null;
   const curId = node._odai_currentNodeId;
   const curState = curId && states ? states.get(curId) : null;
+
+  // "Image N" — generic repeat count of whichever node is currently running.
+  // No assumed total: nothing in the system says ahead of time how many
+  // passes a batch will make.
+  let imageLabel = null;
   if (curState && curState.runCount > 1) imageLabel = `Image ${curState.runCount}`;
+
+  if (node._odai_barRunCount !== (curState?.runCount || 0)) {
+    node._odai_barRunCount = curState?.runCount || 0;
+    node._odai_barHighWater = 0; // a genuinely new pass started — reset the mark
+  }
+  const rawFrac = curState?.max > 0 ? Math.max(0, Math.min(1, curState.value / curState.max)) : ringFrac;
+  const barFrac = Math.max(rawFrac, node._odai_barHighWater || 0);
+  node._odai_barHighWater = barFrac;
 
   return { ringFrac, barFrac, imageLabel };
 }
@@ -443,6 +470,8 @@ app.registerExtension({
       this._odai_progress = null;
       this._odai_nodeStates = null;
       this._odai_currentNodeId = null;
+      this._odai_barHighWater = 0;
+      this._odai_barRunCount = 0;
       applyRenderer(this, isVueNodes());
       this._odaiRendererOff = onRendererChange((vue) => applyRenderer(this, vue));
       return r;
@@ -468,7 +497,7 @@ app.registerExtension({
       const r0 = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
       if (!ctx || isVueNodes() || this.flags?.collapsed) return r0;
 
-      const { cx, cy, radius, bar } = layoutFor(this.size[0], this.size[1]);
+      const { cx, cy, radius, bar, scale } = layoutFor(this.size[0], this.size[1]);
       const color = nodeColorFor(this);
       const state = this._odai_state || "idle";
 
@@ -486,7 +515,7 @@ app.registerExtension({
         // this fixed, 2026-10-31), so there's no room outside it to add to.
         ctx.font = `${Math.max(9, Math.round(radius * 0.17))}px sans-serif`;
         ctx.textAlign = "center";
-        ctx.lineWidth = 3;
+        ctx.lineWidth = Math.max(2, 3 * scale);
         ctx.strokeStyle = "#000000";
         ctx.strokeText(imageLabel, cx, cy + radius * 0.6);
         ctx.fillStyle = "#ffffff";
@@ -508,9 +537,9 @@ app.registerExtension({
         ctx.fillRect(bar.x, bar.bottom - filledH, bar.w, filledH);
 
         const pctLabel = Math.round(barFrac * 100) + "%";
-        ctx.font = "13px sans-serif";
+        ctx.font = `${Math.max(9, Math.round(13 * scale))}px sans-serif`;
         ctx.textAlign = "center";
-        ctx.lineWidth = 3;
+        ctx.lineWidth = Math.max(2, 3 * scale);
         ctx.strokeStyle = "#000000";
         ctx.strokeText(pctLabel, bar.x + bar.w / 2, bar.pctY);
         ctx.fillStyle = "#ffffff";
