@@ -58,6 +58,32 @@ function nodeColorFor(node) {
   return node.color || FALLBACK_COLOR;
 }
 
+// Circle + optional vertical progress bar, both kept fully inside (w, h).
+// A fixed margin wasn't enough once the node was resized into a wide
+// rectangle (screenshot, 2026-10-31): a radius of min(w,h)/2 leaves the
+// ring tangent to the shorter edge with zero clearance, so any rounding or
+// the node's own border overflows it. MARGIN is subtracted from the
+// SHORTER edge specifically to guarantee real clearance on every side.
+const BAR_AREA = 56; // width reserved on the right for the bar + its % label
+const BAR_W = 16;
+const MARGIN = 18;
+
+function layoutFor(w, h) {
+  const showBar = w >= 150;
+  const circleAreaW = showBar ? Math.max(10, w - BAR_AREA) : w;
+  const cx = circleAreaW / 2;
+  const cy = h / 2;
+  const radius = Math.max(10, Math.min(circleAreaW, h) / 2 - MARGIN);
+  let bar = null;
+  if (showBar) {
+    const barX = circleAreaW + (BAR_AREA - BAR_W) / 2;
+    const top = MARGIN;
+    const bottom = h - MARGIN - 18; // room for the % label below the bar
+    bar = { x: barX, w: BAR_W, top, bottom, h: Math.max(0, bottom - top), labelY: h - MARGIN + 2 };
+  }
+  return { cx, cy, radius, bar };
+}
+
 function nativeGroupUnderNode(node) {
   const graph = app.graph;
   if (!graph || typeof graph.getGroupOnPos !== "function") return null;
@@ -224,23 +250,33 @@ function handleClick(node) {
 }
 
 // ── Nodes 2.0 (Vue) face: an inline SVG DOM widget ─────────────────────────
+// viewBox stays a fixed 140x100 (not square): a right-hand column for the
+// vertical progress bar + percentage, the rest for the circle. SVG's default
+// preserveAspectRatio keeps this proportional at any box size.
 function svgIdle(color) {
-  return `<svg viewBox="0 0 100 100" width="100%" height="100%" style="display:block">
-    <circle cx="50" cy="50" r="42" fill="none" stroke="${color}" stroke-width="8"/>
-    <path d="M 38 28 L 38 72 L 74 50 Z" fill="${color}"/>
+  return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
+    <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"/>
+    <path d="M 36 28 L 36 72 L 72 50 Z" fill="${color}"/>
   </svg>`;
 }
 
 function svgRunning(color, frac) {
-  const circumference = 2 * Math.PI * 42;
-  const dash = circumference * Math.max(0, Math.min(1, frac));
-  return `<svg viewBox="0 0 100 100" width="100%" height="100%" style="display:block">
-    <circle cx="50" cy="50" r="42" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
-    <circle cx="50" cy="50" r="42" fill="none" stroke="${color}" stroke-width="8"
+  const f = Math.max(0, Math.min(1, frac));
+  const circumference = 2 * Math.PI * 40;
+  const dash = circumference * f;
+  const barTop = 10, barBottom = 82, barH = barBottom - barTop;
+  const fillTop = barBottom - barH * f;
+  const pct = Math.round(f * 100);
+  return `<svg viewBox="0 0 140 100" width="100%" height="100%" style="display:block">
+    <circle cx="48" cy="50" r="40" fill="none" stroke="${color}${ALPHA_SUFFIX}" stroke-width="8"/>
+    <circle cx="48" cy="50" r="40" fill="none" stroke="${color}" stroke-width="8"
       stroke-dasharray="${dash} ${circumference}" stroke-linecap="round"
-      transform="rotate(-90 50 50)"/>
-    <line x1="35" y1="35" x2="65" y2="65" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
-    <line x1="65" y1="35" x2="35" y2="65" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
+      transform="rotate(-90 48 50)"/>
+    <line x1="35" y1="37" x2="61" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    <line x1="61" y1="37" x2="35" y2="63" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+    <rect x="118" y="${barTop}" width="12" height="${barH}" rx="5" fill="${color}${ALPHA_SUFFIX}"/>
+    <rect x="118" y="${fillTop}" width="12" height="${barH * f}" rx="5" fill="${color}"/>
+    <text x="124" y="95" text-anchor="middle" font-size="13" fill="#ffffff" font-family="sans-serif">${pct}%</text>
   </svg>`;
 }
 
@@ -342,11 +378,7 @@ app.registerExtension({
       const r0 = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
       if (!ctx || isVueNodes() || this.flags?.collapsed) return r0;
 
-      const w = this.size[0];
-      const h = this.size[1];
-      const cx = w / 2;
-      const cy = h / 2;
-      const radius = Math.max(10, Math.min(w, h) / 2 - 6);
+      const { cx, cy, radius, bar } = layoutFor(this.size[0], this.size[1]);
       const color = nodeColorFor(this);
       const state = this._odai_state || "idle";
 
@@ -377,6 +409,20 @@ app.registerExtension({
         ctx.moveTo(cx + xr, cy - xr);
         ctx.lineTo(cx - xr, cy + xr);
         ctx.stroke();
+
+        if (bar) {
+          ctx.lineCap = "butt";
+          ctx.fillStyle = color + ALPHA_SUFFIX;
+          ctx.fillRect(bar.x, bar.top, bar.w, bar.h);
+          const filledH = bar.h * frac;
+          ctx.fillStyle = color;
+          ctx.fillRect(bar.x, bar.bottom - filledH, bar.w, filledH);
+
+          ctx.fillStyle = "#ffffff";
+          ctx.font = "13px sans-serif";
+          ctx.textAlign = "center";
+          ctx.fillText(Math.round(frac * 100) + "%", bar.x + bar.w / 2, bar.labelY);
+        }
       } else {
         ctx.lineWidth = Math.max(2, radius * 0.08);
         ctx.strokeStyle = color;
@@ -402,11 +448,7 @@ app.registerExtension({
     nodeType.prototype.onMouseDown = function (e, pos) {
       if (isVueNodes()) return onMouseDown ? onMouseDown.apply(this, arguments) : false;
 
-      const w = this.size[0];
-      const h = this.size[1];
-      const cx = w / 2;
-      const cy = h / 2;
-      const radius = Math.max(10, Math.min(w, h) / 2 - 6);
+      const { cx, cy, radius } = layoutFor(this.size[0], this.size[1]);
       const dx = pos[0] - cx;
       const dy = pos[1] - cy;
       if (Math.hypot(dx, dy) <= radius) {
