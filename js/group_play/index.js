@@ -174,8 +174,7 @@ function finishOwner() {
   const node = _owner;
   node._odai_state = "idle";
   node._odai_progress = null;
-  node._odai_totalIds = null;
-  node._odai_finishedIds = null;
+  node._odai_nodeStates = null;
   node._odai_queueTotal = null;
   node._odai_queueRemaining = null;
   _owner = null;
@@ -202,25 +201,32 @@ function installListenersOnce() {
   // Real backend event, not invented: comfy_execution/progress.py
   // _send_progress_state sends { prompt_id, nodes: { id: {value,max,state,...} } }
   // for every node touched so far (state: pending/running/finished/error);
-  // "pending" nodes are omitted until they start, so the fraction below is an
-  // approximation that only gets more accurate as the run proceeds and is
-  // exact at completion (the denominator stops growing once every node that
-  // will run has started at least once).
+  // "pending" nodes are omitted until they start seen is an approximation
+  // that only gets more accurate as the run proceeds and is exact once
+  // every node that will run has started at least once.
+  //
+  // Each node's own {value,max} is kept (not just finished/not): a plain
+  // finished-count/seen-count ratio freezes solid for the whole time a slow
+  // node (KSampler, 14 steps) is "running" but not yet "finished" — measured
+  // 2026-10-31, bar stuck at the same % through an entire sample run. Blending
+  // each running node's own fraction in makes it creep forward continuously,
+  // matching what "overall progress" actually looks like to someone watching.
   api.addEventListener("progress_state", (e) => {
     if (!_owner) return;
     const d = (e && e.detail) || {};
     const nodes = d.nodes || {};
-    const seen = _owner._odai_totalIds || (_owner._odai_totalIds = new Set());
-    const done = _owner._odai_finishedIds || (_owner._odai_finishedIds = new Set());
+    const states = _owner._odai_nodeStates || (_owner._odai_nodeStates = new Map());
     for (const [id, st] of Object.entries(nodes)) {
-      seen.add(id);
-      if (st && st.state === "finished") done.add(id);
+      if (!st) continue;
+      states.set(id, { value: Number(st.value) || 0, max: Number(st.max) || 0, state: st.state });
     }
     repaint(_owner);
   });
   // Queue position ("N of X"). Real backend event: server.py get_queue_info /
-  // queue_updated send { status: { exec_info: { queue_remaining } } } on every
-  // queue change — the same counter the native top bar's queue display reads.
+  // queue_updated send a status payload with exec_info.queue_remaining on
+  // every queue change — the frontend unwraps it before dispatch (detail is
+  // the status object itself, not {status: ...}) — same counter the native
+  // top bar's queue display reads.
   // It's a single global remaining-count, not a list of job identities, so
   // "X" is the remaining count first observed right after this node queued
   // (treated as the starting total) and "N" counts down as that remaining
@@ -228,8 +234,12 @@ function installListenersOnce() {
   // else queues more work on the server while this is running.
   api.addEventListener("status", (e) => {
     if (!_owner) return;
+    // detail IS the status object already — server.py sends {sid?, status},
+    // and the frontend's own WS handler dispatches detail = data.status
+    // directly (confirmed in api-*.js: dispatchCustomEvent("status",
+    // t.data.status ?? null)) — there is no extra .status wrapper here.
     const d = (e && e.detail) || {};
-    const remaining = d.status?.exec_info?.queue_remaining;
+    const remaining = d.exec_info?.queue_remaining;
     if (typeof remaining !== "number") return;
     if (_owner._odai_queueTotal == null) _owner._odai_queueTotal = Math.max(remaining, 1);
     _owner._odai_queueRemaining = remaining;
@@ -265,8 +275,7 @@ function queueGroup(node) {
 
   node._odai_state = "running";
   node._odai_progress = { value: 0, max: 0 };
-  node._odai_totalIds = new Set();
-  node._odai_finishedIds = new Set();
+  node._odai_nodeStates = new Map();
   node._odai_queueTotal = null;
   node._odai_queueRemaining = null;
   _owner = node;
@@ -301,9 +310,17 @@ function cancelRun() {
 function fractionsFor(node) {
   const p = node._odai_progress || { value: 0, max: 0 };
   const ringFrac = p.max > 0 ? Math.max(0, Math.min(1, p.value / p.max)) : 0;
-  const total = node._odai_totalIds ? node._odai_totalIds.size : 0;
-  const done = node._odai_finishedIds ? node._odai_finishedIds.size : 0;
-  const barFrac = total > 0 ? Math.max(0, Math.min(1, done / total)) : 0;
+
+  let barFrac = 0;
+  const states = node._odai_nodeStates;
+  if (states && states.size > 0) {
+    let sum = 0;
+    for (const st of states.values()) {
+      if (st.state === "finished" || st.state === "error") sum += 1;
+      else if (st.state === "running") sum += st.max > 0 ? Math.max(0, Math.min(1, st.value / st.max)) : 0;
+    }
+    barFrac = Math.max(0, Math.min(1, sum / states.size));
+  }
 
   let queueLabel = null;
   const qTotal = node._odai_queueTotal;
@@ -445,8 +462,7 @@ app.registerExtension({
       installListenersOnce();
       this._odai_state = "idle";
       this._odai_progress = null;
-      this._odai_totalIds = null;
-      this._odai_finishedIds = null;
+      this._odai_nodeStates = null;
       this._odai_queueTotal = null;
       this._odai_queueRemaining = null;
       applyRenderer(this, isVueNodes());
